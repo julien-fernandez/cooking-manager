@@ -1,0 +1,5292 @@
+"""FastAPI application — recipe browser + ingest trigger."""
+
+import asyncio
+import base64
+import dataclasses
+import json
+import logging
+import os
+import uuid
+from contextlib import asynccontextmanager
+import datetime
+from pathlib import Path
+from typing import Literal
+
+from fastapi import FastAPI, Form, Query, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict
+
+from cooking_manager.presence import (
+    CanteenEntry,
+    ChildWeekUnknown,
+    CustodyInfo,
+    HouseholdConfig,
+    Referential,
+)
+from cooking_manager.feedback import (
+    APPRECIATION_FACET,
+    ISSUE_FACET,
+    VERDICT_FACET,
+    Reading,
+    UnknownConcept,
+    interpret,
+    validate_concept,
+)
+from cooking_manager.substitutions import VOCABULARY_VERSION, load_vocabulary
+from cooking_manager.ingredients import parse_recipe_body
+from cooking_manager.matching import food_link_counts
+
+from . import drive_a, book_import, images
+from . import gates as gate_engine
+from .config import DATABASE_DSN, OLLAMA_URL
+from .db import get_pool, init_schema, close_pool
+from .ingest import (UndeclaredParts, relink_meals, write_recipe,
+                     write_recipe_ingredients, _link_meals)
+from .url_parser import parse_recipe_html, parse_recipe_url
+from .url_parser.draft import to_draft as url_to_draft
+
+async def _get_recipe_id(conn, slug: str) -> int:
+    row = await conn.fetchrow("SELECT id FROM recipe WHERE slug = $1", slug)
+    if not row:
+        raise HTTPException(404, "Recipe not found")
+    return row["id"]
+
+def _serialize_dates(d: dict, keys: tuple[str, ...]) -> None:
+    for key in keys:
+        if d.get(key) and hasattr(d[key], "isoformat"):
+            d[key] = d[key].isoformat()
+
+_ROUNDING = {
+    "macros_kcal": 1, "macros_protein": 1, "macros_carbs": 1, "macros_fat": 1,
+    "kcal": 1, "protein": 1, "carbs": 1, "fat": 1,
+    "protein_density": 3,
+    "price_unit": 2, "total_price": 2, "price_per_kg": 2, "total": 2,
+}
+
+def _round_numeric(d: dict) -> dict:
+    """Arrondit les champs numériques connus et normalise Decimal → float."""
+    for key, digits in _ROUNDING.items():
+        val = d.get(key)
+        if val is None or isinstance(val, bool):
+            continue
+        try:
+            d[key] = round(float(val), digits)
+        except (TypeError, ValueError):
+            continue
+    return d
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_schema(DATABASE_DSN)
+    yield
+    await close_pool()
+
+app = FastAPI(title="Cooking Manager", version="2.0.0", lifespan=lifespan)
+
+@app.exception_handler(ChildWeekUnknown)
+async def _child_week_unknown(request, exc: ChildWeekUnknown):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+@app.get("/api/recipes")
+async def list_recipes(
+    status: str | None = None,
+    family: str | None = None,
+    tag: str | None = None,
+    q: str | None = None,
+    menu: str | None = Query(default=None, description="slug de menu — restreint à la semaine"),
+    limit: int = Query(default=100, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    pool = await get_pool(DATABASE_DSN)
+    clauses = []
+    params = []
+    idx = 1
+
+    if menu:
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM menu_meal mm JOIN menu mu ON mu.id = mm.menu_id "
+            f"WHERE mm.recipe_id = recipe.id AND mu.slug = ${idx})"
+        )
+        params.append(menu)
+        idx += 1
+
+    if status:
+        clauses.append(f"status = ${idx}")
+        params.append(status)
+        idx += 1
+    if family:
+        clauses.append(f"family = ${idx}")
+        params.append(family)
+        idx += 1
+    if tag:
+        clauses.append(f"${idx} = ANY(tags)")
+        params.append(tag)
+        idx += 1
+    if q:
+        clauses.append(f"(title ILIKE ${idx} OR slug ILIKE ${idx})")
+        params.append(f"%{q}%")
+        idx += 1
+
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.extend([limit, offset])
+
+    occurrences = ""
+    if menu:
+        occurrences = """,
+               (SELECT COUNT(*) FROM menu_meal mm JOIN menu mu ON mu.id = mm.menu_id
+                 WHERE mm.recipe_id = recipe.id AND mu.slug = $1) AS occurrences,
+               (SELECT ARRAY_AGG(mm.day_label || ' · ' || mm.slot ORDER BY mm.position)
+                  FROM menu_meal mm JOIN menu mu ON mu.id = mm.menu_id
+                 WHERE mm.recipe_id = recipe.id AND mu.slug = $1) AS scheduled_at"""
+
+    sql = f"""
+        SELECT id, slug, title, status, recipe_type, family, servings,
+               total_time_min, prep_time_min, cook_time_min,
+               tags, compatible_constraints, sources, appreciated_by,
+               applied_substitutions, mediterranean_criteria,
+               construction_regime, execution_count, lieu_execution,
+               macros_kcal, macros_protein, macros_carbs, macros_fat,
+               protein_density, photo_url, created, updated{occurrences}
+        FROM recipe {where}
+        ORDER BY title
+        LIMIT ${idx} OFFSET ${idx + 1}
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM recipe {where}", *params[:-2])
+
+    return {
+        "total": total,
+        "recipes": [_recipe_to_dict(r) for r in rows],
+    }
+
+@app.get("/api/recipes/{slug}")
+async def get_recipe(slug: str):
+    """Fiche complète : métadonnées + ingrédients et étapes STRUCTURÉS."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM recipe WHERE slug = $1", slug)
+        if not row:
+            raise HTTPException(404, "Recipe not found")
+        ingredients = await conn.fetch(
+            """SELECT ri.position, ri.raw, ri.qty_min, ri.qty_max, ri.unit, ri.name,
+                      ri.name_normalized, ri.is_optional, ri.parsed,
+                      ri.for_person_id, ri.replaces_position, p.name AS for_person,
+                      COALESCE(f.pantry_staple, FALSE) AS pantry_staple
+                 FROM recipe_ingredient ri
+                 LEFT JOIN person p ON p.id = ri.for_person_id
+                 LEFT JOIN food f ON f.key = ri.food_key
+                WHERE ri.recipe_id = $1 ORDER BY ri.position""",
+            row["id"],
+        )
+        steps = await conn.fetch(
+            "SELECT position, text FROM recipe_step WHERE recipe_id = $1 ORDER BY position",
+            row["id"],
+        )
+
+    data = _recipe_to_dict(row)
+    data["ingredients"] = [
+        _round_numeric({**dict(i), "qty_min": i["qty_min"], "qty_max": i["qty_max"]})
+        for i in ingredients
+    ]
+    data["steps"] = [dict(s) for s in steps]
+    from cooking_manager.parts import parts_unmentioned
+    data["parts_unmentioned"] = parts_unmentioned(
+        [dict(i) for i in ingredients], [str(s["text"] or "") for s in steps])
+    return data
+
+@app.get("/api/filters")
+async def get_filters():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        statuses = await conn.fetch(
+            "SELECT DISTINCT status FROM recipe ORDER BY status"
+        )
+        families = await conn.fetch(
+            "SELECT DISTINCT family FROM recipe WHERE family IS NOT NULL ORDER BY family"
+        )
+        tags = await conn.fetchval("""
+            SELECT ARRAY_AGG(DISTINCT t ORDER BY t)
+            FROM recipe, UNNEST(tags) AS t
+        """)
+    return {
+        "statuses": [r["status"] for r in statuses],
+        "families": [r["family"] for r in families],
+        "tags": tags or [],
+    }
+
+@app.get("/api/menus")
+async def list_menus():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM menu ORDER BY week_start DESC")
+    menus = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("meals"), str):
+            d["meals"] = json.loads(d["meals"])
+        _serialize_dates(d, ("created", "updated", "week_start", "week_end"))
+        menus.append(d)
+    return {"menus": menus}
+
+MENU_STATUSES = ("proposed", "active", "archived")
+
+def _check_menu_status(status: str) -> None:
+    if status not in MENU_STATUSES:
+        raise HTTPException(
+            422, f"statut de menu {status!r} inconnu, attendu parmi {list(MENU_STATUSES)}")
+
+class MenuCreate(BaseModel):
+    title: str
+    slug: str | None = None
+    week_start: datetime.date | None = None
+    week_end: datetime.date | None = None
+    configuration: str | None = None
+    status: str = "proposed"
+    linked_recipes: list[str] = []
+    meals: list[dict] | None = None
+    body: str | None = None
+
+@app.post("/api/menus")
+async def create_menu(menu: MenuCreate):
+    """Créer ou mettre à jour un menu. Le slug est la clé naturelle : rejouer le"""
+    from cooking_manager.normalizer import slugify
+
+    _check_menu_status(menu.status)
+    slug = menu.slug or slugify(menu.title)
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        if menu.status == "active" and await conn.fetchval(
+                "SELECT status FROM menu WHERE slug = $1", slug) != "active":
+            raise HTTPException(409, {
+                "error": "gate", "transition": "publish",
+                "hint": f"publier par PATCH /api/menus/{slug} "
+                        '{"status":"active"} — il passe par les gates'})
+        row = await conn.fetchrow(
+            """INSERT INTO menu (slug, title, week_start, week_end, configuration, status,
+                                linked_recipes, meals, body, created, updated, meals_changed_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, CURRENT_DATE, CURRENT_DATE, NOW())
+               ON CONFLICT (slug) DO UPDATE SET
+                   title=$2, week_start=$3, week_end=$4, configuration=$5, status=$6,
+                   linked_recipes=$7, body=$9, updated=CURRENT_DATE, ingested_at=NOW(),
+                   meals_changed_at = CASE WHEN menu.meals IS DISTINCT FROM $8::jsonb
+                                           THEN NOW() ELSE menu.meals_changed_at END,
+                   meals=$8::jsonb
+               RETURNING id, slug, title, (xmax = 0) AS inserted""",
+            slug, menu.title, menu.week_start, menu.week_end, menu.configuration,
+            menu.status, menu.linked_recipes,
+            json.dumps(menu.meals) if menu.meals else None,
+            menu.body,
+        )
+        linked, orphan = await _link_meals(conn)
+        await _skip_gone_cart_lines(conn, row["slug"])
+    return {"id": row["id"], "slug": row["slug"], "title": row["title"],
+            "created": row["inserted"],
+            "meals_linked": linked, "meals_orphan": orphan}
+
+class MenuStatusUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str
+    override_reason: str = ""
+    actor: Literal["agent", "ipad"] = "agent"
+
+@app.patch("/api/menus/{slug}")
+async def update_menu_status(slug: str, body: MenuStatusUpdate):
+    """Changer le seul statut d'un menu : l'iPad affiche le menu `active`, donc en activer un archive les autres."""
+    _check_menu_status(body.status)
+    if body.status == "active":
+        await gate_engine.require_gates(slug, "publish", body.override_reason, body.actor)
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "UPDATE menu SET status = $2, updated = CURRENT_DATE WHERE slug = $1 RETURNING slug",
+                slug, body.status,
+            )
+            if not row:
+                raise HTTPException(404, f"Menu introuvable : {slug}")
+            archived = []
+            if body.status == "active":
+                archived = await conn.fetch(
+                    """UPDATE menu SET status = 'archived', updated = CURRENT_DATE
+                        WHERE status = 'active' AND slug <> $1 RETURNING slug""",
+                    slug,
+                )
+    return {"slug": slug, "status": body.status,
+            "archived": sorted(r["slug"] for r in archived)}
+
+@app.get("/api/menus/{slug}/gates")
+async def menu_gates(slug: str):
+    """La semaine gate par gate, recalculée à chaque appel — `pas_câblé` n'est jamais vert (spec 01)."""
+    report, _ = await gate_engine.evaluate(slug)
+    return report
+
+
+
+class RecipeWrite(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    title: str
+    slug: str | None = None
+    body: str = ""
+
+RECIPE_STATUSES = ("draft", "to_test", "active", "validated")
+
+async def _persist_recipe(payload: dict, slug_override: str | None) -> dict:
+    from cooking_manager.normalizer import normalize_recipe, slugify
+
+    raw = dict(payload)
+    raw["_body"] = raw.pop("body", "") or ""
+    if slug_override:
+        raw["slug"] = slug_override
+    if not raw.get("slug"):
+        raw["slug"] = slugify(raw.get("title", ""))
+    normalized, warns = normalize_recipe(raw)
+    status = normalized.get("status")
+    if status is not None and status not in RECIPE_STATUSES:
+        raise HTTPException(
+            422, f"statut {status!r} inconnu, attendu parmi {list(RECIPE_STATUSES)}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        try:
+            w, pi, ur, ps = await write_recipe(conn, normalized)
+        except UndeclaredParts as e:
+            raise HTTPException(422, {
+                "error": "une part de convive se déclare en donnée, pas en parenthèse",
+                "hint": "poser `for_person_id` (et `replaces_position` si la part remplace "
+                        "une ligne du plat commun) sur l'ingrédient concerné",
+                "refused": e.refused}) from None
+    return {
+        "slug": normalized.get("slug"),
+        "warnings": warns + w,
+        "ingredients_parsed": pi,
+        "ingredients_raw_only": ur,
+        "steps_parsed": ps,
+    }
+
+@app.post("/api/recipes", status_code=201)
+async def create_recipe(body: RecipeWrite):
+    """Créer une recette en base — ADR 0010 voie b."""
+    return await _persist_recipe(body.model_dump(), None)
+
+@app.put("/api/recipes/{slug}")
+async def update_recipe(slug: str, body: RecipeWrite):
+    """Remplacer une recette (upsert par slug). Re-parse ingrédients et étapes."""
+    return await _persist_recipe(body.model_dump(), slug)
+
+@app.delete("/api/recipes/{slug}")
+async def delete_recipe(slug: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rid = await conn.fetchval("SELECT id FROM recipe WHERE slug = $1", slug)
+        if rid is None:
+            raise HTTPException(404, f"Recette introuvable : {slug}")
+        await conn.execute("DELETE FROM recipe_ingredient WHERE recipe_id = $1", rid)
+        await conn.execute("DELETE FROM recipe_step WHERE recipe_id = $1", rid)
+        await conn.execute("UPDATE menu_meal SET recipe_id = NULL WHERE recipe_id = $1", rid)
+        await conn.execute("DELETE FROM recipe WHERE id = $1", rid)
+    return {"deleted": slug}
+
+async def _load_food_base_from_db() -> dict:
+    """Tables food + food_form → index FoodEntry, toutes les formes d'un aliment."""
+    from cooking_manager.food_repository import base_from_form_rows
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT f.key, f.name, f.source, f.kind,
+                      ff.label, ff.kcal, ff.protein, ff.carbs, ff.fat
+                 FROM food f JOIN food_form ff ON ff.food_key = f.key"""
+        )
+    return base_from_form_rows([dict(r) for r in rows])
+
+
+async def _compute_recipe_macros(slug: str) -> dict:
+    """Macros calculées depuis les ingrédients, avec leur provenance."""
+    from cooking_manager import nutrition as nut
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, servings FROM recipe WHERE slug = $1", slug
+        )
+        if row is None:
+            raise HTTPException(404, f"Recette introuvable : {slug}")
+        ingredients = [dict(r) for r in await conn.fetch(
+            """SELECT raw, name, name_normalized, qty_min, unit, is_optional,
+                      position, for_person_id, replaces_position
+                 FROM recipe_ingredient WHERE recipe_id = $1 ORDER BY position""",
+            row["id"],
+        )]
+        products = await conn.fetch(
+            """SELECT DISTINCT ON (item_requested) item_requested, product_name, nutrition
+                 FROM shopping_product WHERE nutrition IS NOT NULL"""
+        )
+
+    drive = {}
+    for p in products:
+        raw = p["nutrition"]
+        entry = nut.entry_from_product(
+            p["item_requested"] or p["product_name"],
+            json.loads(raw) if isinstance(raw, str) else raw,
+        )
+        if entry:
+            drive[entry.key] = entry
+
+    db_base = await _load_food_base_from_db()
+    base = nut.merge_sources(db_base, drive)
+    result = nut.recipe_macros(ingredients, base)
+
+    per_portion = None
+    if row["servings"]:
+        per_portion = {
+            k: round(getattr(result, k) / row["servings"], 1)
+            for k in ("kcal", "protein", "carbs", "fat")
+        }
+
+    return {
+        "slug": slug,
+        "totals": {k: getattr(result, k) for k in ("kcal", "protein", "carbs", "fat")},
+        "per_portion": per_portion,
+        "servings": row["servings"],
+        "coverage": round(result.coverage, 2),
+        "conclusive": result.coverage >= 0.95,
+        "reconciliation": nut.reconcile(result.kcal, result.protein,
+                                        result.carbs, result.fat),
+        "sources": sorted({r.entry.kind for r in result.resolved if r.entry}),
+        "resolved": [
+            {"name": r.name, "grams": r.grams,
+             "food": r.entry.title if r.entry else None,
+             "source": r.entry.source if r.entry else None}
+            for r in result.resolved
+        ],
+        "unresolved": [{"name": u.name, "reason": u.reason} for u in result.unresolved],
+    }
+
+@app.get("/api/recipes/{slug}/macros")
+async def recipe_macros_endpoint(slug: str):
+    """Macros d'une recette — calcul seul, rien n'est écrit."""
+    return await _compute_recipe_macros(slug)
+
+@app.post("/api/recipes/{slug}/macros")
+async def persist_recipe_macros(slug: str):
+    """Écrit les macros en base — SEULEMENT si le calcul conclut (#159)."""
+    computed = await _compute_recipe_macros(slug)
+    if not computed["conclusive"]:
+        return {**computed, "written": False,
+                "reason": f"couverture {computed['coverage']} : un total partiel écrit en base "
+                          "se lirait comme une mesure — lire `unresolved`"}
+
+    totals = computed["totals"]
+    portion = computed["per_portion"]
+    density = (round(portion["protein"] / portion["kcal"] * 1000, 2)
+               if portion and portion.get("kcal") else None)
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        written = await conn.fetchrow(
+            """UPDATE recipe
+                  SET macros_kcal = $2, macros_protein = $3, macros_carbs = $4,
+                      macros_fat = $5, protein_density = $6, updated = CURRENT_DATE
+                WHERE slug = $1
+            RETURNING slug, macros_kcal""",
+            slug, totals["kcal"], totals["protein"], totals["carbs"], totals["fat"], density)
+    if written is None:
+        raise HTTPException(404, f"Recette introuvable : {slug}")
+    return {**computed, "written": True, "protein_density": density}
+
+async def _memberships(conn) -> dict[str, str]:
+    """Le rang de chacun : `resident`, `regular_guest`, `guest` — ADR 0025."""
+    rows = await conn.fetch(
+        """SELECT p.name, COALESCE(hm.membership, 'guest') AS membership
+             FROM person p
+             LEFT JOIN household_member hm ON hm.person_id = p.id"""
+    )
+    return {r["name"]: r["membership"] for r in rows}
+
+async def _is_staple_food(conn, food_key: str | None) -> bool:
+    """Vrai si la ligne désigne un basique du placard (ADR 0043)."""
+    if not food_key:
+        return False
+    return bool(await conn.fetchval("SELECT pantry_staple FROM food WHERE key = $1", food_key))
+
+
+async def _person_ids(conn) -> dict[str, int]:
+    """Nom → `person.id`, la clé par laquelle une part de convive se lit (#159)."""
+    rows = await conn.fetch("SELECT id, name FROM person")
+    return {r["name"]: r["id"] for r in rows}
+
+@app.get("/api/recipes/{slug}/compatibility")
+async def recipe_compatibility(
+    slug: str,
+    day: str | None = None,
+    slot: str = "dinner",
+    convives: str | None = None,
+):
+    """Compatibilité d'une recette sur ses INGRÉDIENTS, à une tablée — ADR 0025."""
+    from cooking_manager.convives import check_ingredients
+    from cooking_manager.parts import declared_parts, undeclared_part
+    from cooking_manager.presence import attendees
+    from cooking_manager.substitutions import (
+        detect_context,
+        diets_at_table,
+        fallback_repairs,
+        repair_ingredients,
+        unrepaired_conflicts,
+    )
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe = await conn.fetchrow("SELECT id, title FROM recipe WHERE slug = $1", slug)
+        if recipe is None:
+            raise HTTPException(404, f"Recette introuvable : {slug}")
+        recipe_id = recipe["id"]
+        rows = await conn.fetch(
+            """SELECT raw, name, name_normalized, position,
+                      for_person_id, replaces_position
+                 FROM recipe_ingredient
+                WHERE recipe_id = $1 ORDER BY position""",
+            recipe_id,
+        )
+        step_rows = await conn.fetch(
+            "SELECT text FROM recipe_step WHERE recipe_id = $1 ORDER BY position",
+            recipe_id,
+        )
+        known = await load_convives_from_db(conn)
+        memberships = await _memberships(conn)
+        person_ids = await _person_ids(conn)
+        if convives:
+            wanted = [n.strip() for n in convives.split(",") if n.strip()]
+            table_source = "convives nommés"
+        elif day:
+            household = await load_household_config(conn)
+            referential = await load_referential_from_db(conn)
+            wanted = attendees(
+                datetime.date.fromisoformat(day), slot, referential, household)
+            table_source = f"présence réelle du {day} {slot}"
+        else:
+            wanted = [n for n, m in memberships.items() if m == "resident"]
+            table_source = "résidents du foyer"
+        at_table = [known[n] for n in wanted if n in known]
+
+    ingredients = [dict(r) for r in rows]
+    conflicts = check_ingredients(ingredients, at_table, person_ids)
+    declared = declared_parts(ingredients)
+    context = detect_context(
+        recipe["title"] or slug,
+        ingredients=tuple(str(r["name"] or r["raw"] or "") for r in rows),
+        steps=tuple(str(s["text"] or "") for s in step_rows),
+        convives=tuple(c.name for c in at_table),
+    )
+    ingredient_texts = [str(r["raw"] or r["name"] or "") for r in rows]
+    repairs = repair_ingredients(ingredient_texts, diets_at_table(conflicts), context)
+    repairs += fallback_repairs(conflicts, repairs, context)
+    return {
+        "slug": slug,
+        "ingredients_checked": len(ingredients),
+        "conclusive": bool(ingredients),
+        "table": {"source": table_source,
+                  "convives": [c.name for c in at_table]},
+        "declared_parts": [
+            {"person_id": d.person_id, "position": d.position,
+             "replaces_position": d.replaces_position, "raw": d.raw}
+            for d in declared],
+        "parts_undeclared": [
+            {"position": line.get("position"), "raw": line.get("raw"),
+             "reason": motif}
+            for line in ingredients
+            if (motif := undeclared_part(str(line.get("raw") or ""),
+                                         line.get("for_person_id"), person_ids))],
+        "conflicts": [
+            {"convive": c.convive, "reason": c.reason, "matched": c.matched,
+             "membership": memberships.get(c.convive, "guest")}
+            for c in conflicts
+        ],
+        "context": {
+            "cuisines": list(context.cuisines),
+            "cooking_methods": list(context.cooking_methods),
+        },
+        "repairs": [
+            {
+                "ingredient": r.ingredient,
+                "diet": r.diet,
+                "convives": [c.name for c in at_table if c.diet == r.diet],
+                "replace": r.substitution.source,
+                "with": r.substitution.target,
+                "reason": r.substitution.reason,
+                "confidence": round(r.substitution.confidence, 2),
+                "fallback": r.substitution.is_fallback,
+            }
+            for r in repairs
+        ],
+        "unrepaired": [
+            {
+                "ingredient": u.ingredient,
+                "diet": u.diet,
+                "convive": u.convive,
+                "reason": u.reason,
+            }
+            for u in unrepaired_conflicts(conflicts, repairs)
+        ],
+    }
+
+@app.get("/api/menus/{slug}/compatibility")
+async def menu_compatibility(slug: str, from_date: str | None = None):
+    """Contrôle de compatibilité du menu, repas par repas ; `from_date` ne juge que les repas à venir."""
+    from datetime import date as _date
+
+    from cooking_manager.convives import (
+        check_ingredients,
+        check_meal,
+        inherit_leftovers,
+    )
+    from cooking_manager.effort import fits_weeknight, read_effort
+    from cooking_manager.parts import declared_diets, parts_unmentioned, shares_for
+    from cooking_manager.substitutions import (
+        DIET_REASON_PREFIX,
+        Discovery,
+        detect_context,
+        diets_at_table,
+        fallback_repairs,
+        prefer_discovered,
+        repair_ingredients,
+        unrepaired_conflicts,
+    )
+
+    from cooking_manager.presence import attendees
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu_row = await conn.fetchrow(
+            "SELECT slug, title FROM menu WHERE slug = $1", slug)
+        if not menu_row:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        menu_slug, menu_title = menu_row["slug"], menu_row["title"]
+        household = await load_household_config(conn)
+        referential = await load_referential_from_db(conn)
+        convives = await load_convives_from_db(conn)
+        memberships = await _memberships(conn)
+        person_ids = await _person_ids(conn)
+        pref_rows = await conn.fetch(
+            """SELECT dp.kind, dp.target, dp.value, dp.unit, dp.scope, dp.reason,
+                      COALESCE(p.name, '') AS person
+                 FROM dietary_preference dp
+                 LEFT JOIN person p ON p.id = dp.person_id
+                WHERE dp.until IS NULL OR dp.until >= CURRENT_DATE
+                ORDER BY dp.kind, dp.target"""
+        )
+        vocabulary = [r["name"] for r in await conn.fetch(
+            "SELECT DISTINCT name FROM recipe_ingredient WHERE name IS NOT NULL"
+        )]
+        time_rows = await conn.fetch(
+            """SELECT mm.id AS meal_id, r.total_time_min
+                 FROM menu_meal mm JOIN recipe r ON r.id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)""",
+            slug,
+        )
+        detail_rows = await conn.fetch(
+            """SELECT mm.id AS meal_id, mm.recipe_id, r.slug AS recipe_slug,
+                      ri.name, ri.name_normalized, ri.raw,
+                      ri.position, ri.for_person_id, ri.replaces_position
+                 FROM menu_meal mm
+                 JOIN recipe r ON r.id = mm.recipe_id
+                 JOIN recipe_ingredient ri ON ri.recipe_id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)
+                ORDER BY mm.position, ri.position""",
+            slug,
+        )
+        step_rows = await conn.fetch(
+            """SELECT mm.id AS meal_id, rs.text
+                 FROM menu_meal mm
+                 JOIN recipe_step rs ON rs.recipe_id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)
+                ORDER BY mm.position, rs.position""",
+            slug,
+        )
+        discovery_rows = await conn.fetch(
+            """SELECT mm.id AS meal_id, sd.original_ingredient, sd.substitute_ingredient,
+                      sd.outcome, COALESCE(sd.who_preferred, '') AS who_preferred
+                 FROM menu_meal mm
+                 JOIN substitution_discovery sd ON sd.recipe_id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)""",
+            slug,
+        )
+        meal_rows = await conn.fetch(
+            """SELECT mm.id AS meal_id, mm.day_label, mm.day, mm.slot, mm.dish,
+                      mm.position, mm.match_kind, mm.leftovers_of,
+                      COALESCE(array_agg(ri.name)
+                               FILTER (WHERE ri.name IS NOT NULL), '{}') AS ingredients
+                 FROM menu_meal mm
+                 LEFT JOIN recipe_ingredient ri ON ri.recipe_id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)
+                GROUP BY mm.id, mm.day_label, mm.day, mm.slot, mm.dish, mm.position,
+                         mm.match_kind, mm.leftovers_of
+                ORDER BY mm.position""",
+            slug,
+        )
+
+    lines_by_meal: dict[int, list[dict]] = {}
+    for row in detail_rows:
+        lines_by_meal.setdefault(row["meal_id"], []).append(dict(row))
+    steps_by_meal: dict[int, list[str]] = {}
+    for row in step_rows:
+        steps_by_meal.setdefault(row["meal_id"], []).append(str(row["text"] or ""))
+    found_by_meal: dict[int, list[Discovery]] = {}
+    for row in discovery_rows:
+        found_by_meal.setdefault(row["meal_id"], []).append(Discovery(
+            original=row["original_ingredient"],
+            substitute=row["substitute_ingredient"],
+            outcome=row["outcome"], who_preferred=row["who_preferred"],
+        ))
+
+    clock_by_meal = {r["meal_id"]: r["total_time_min"] for r in time_rows}
+
+    window_start = _date.fromisoformat(from_date) if from_date else None
+    judged_rows = [m for m in meal_rows
+                   if window_start is None or m["day"] is None or m["day"] >= window_start]
+    unsourced = inherit_leftovers([dict(m) for m in judged_rows],
+                                  lines_by_meal, steps_by_meal)
+
+    checked, conflict_count, uncovered_count, repair_count = [], 0, 0, 0
+    too_heavy: list[dict] = []
+    unmentioned: list[dict] = []
+    seen_recipes: set[str] = set()
+    for meal in judged_rows:
+        dish = meal["dish"]
+        if not dish:
+            continue
+        lines = lines_by_meal.get(meal["meal_id"], [])
+        slug_of_meal = lines[0].get("recipe_slug") if lines else None
+        if slug_of_meal and slug_of_meal not in seen_recipes:
+            seen_recipes.add(slug_of_meal)
+            unmentioned += [{"recipe_slug": slug_of_meal, "part": p} for p in parts_unmentioned(
+                lines, steps_by_meal.get(meal["meal_id"], []))]
+        day = meal["day"] if isinstance(meal["day"], _date) else None
+        slot = meal["slot"]
+
+        present = attendees(day, slot, referential, household) if day else list(convives)
+        at_table_now = [convives[n] for n in present if n in convives]
+
+        reading = read_effort(steps_by_meal.get(meal["meal_id"], []))
+        clock = clock_by_meal.get(meal["meal_id"])
+        weeknight = fits_weeknight(reading, clock)
+        is_weekday_dinner = slot == "dinner" and day is not None and day.weekday() <= 4
+        if is_weekday_dinner and weeknight is False:
+            too_heavy.append({"day": meal["day_label"], "dish": dish,
+                              "band": reading.band, "total_time_min": clock,
+                              "markers": list(reading.markers)})
+
+        at_table = at_table_now
+        repairs, unrepaired, declared_parts, conflicts = [], [], [], []
+        if lines and at_table:
+            ingredient_conflicts = check_ingredients(lines, at_table, person_ids)
+            conflicts = ingredient_conflicts
+            context = detect_context(
+                dish,
+                ingredients=tuple(str(line.get("name") or line.get("raw") or "")
+                                  for line in lines),
+                steps=tuple(steps_by_meal.get(meal["meal_id"], [])),
+                convives=tuple(c.name for c in at_table),
+            )
+            texts = [str(line.get("raw") or line.get("name") or "") for line in lines]
+            repairs = repair_ingredients(
+                texts, diets_at_table(ingredient_conflicts), context)
+            repairs += fallback_repairs(ingredient_conflicts, repairs, context)
+            already = declared_diets(lines, at_table, person_ids)
+            declared_parts = sorted(already)
+            repairs = [r for r in repairs if r.diet not in already]
+            repairs, refused = prefer_discovered(
+                repairs, found_by_meal.get(meal["meal_id"], []))
+            unrepaired = [
+                u for u in unrepaired_conflicts(ingredient_conflicts, repairs)
+                if u.diet not in already
+            ] + refused
+
+        if not lines:
+            conflicts = check_meal(dish, at_table)
+        conflict_count += len(conflicts)
+
+        repaired_diets = {r.diet for r in repairs}
+        shares = shares_for(at_table, len(present) or 4)
+        rendered = []
+        for c in conflicts:
+            diet = c.reason[len(DIET_REASON_PREFIX):].strip()                 if c.reason.startswith(DIET_REASON_PREFIX) else ""
+            covered = bool(diet) and (diet in repaired_diets or diet in declared_parts)
+            if not covered:
+                uncovered_count += 1
+            rendered.append({"convive": c.convive, "reason": c.reason,
+                             "matched": c.matched, "repaired": covered,
+                             "membership": memberships.get(c.convive, "guest")})
+        repair_count += len(repairs)
+
+        checked.append({
+            "day": meal["day_label"],
+            "date": day.isoformat() if day else None,
+            "slot": slot, "dish": dish, "attendees": present,
+            "at_home": bool(present),
+            "conflicts": rendered,
+            "effort": {**reading.as_dict(), "total_time_min": clock,
+                       "fits_weeknight": weeknight},
+            "declared_parts": declared_parts,
+            "repairs": [
+                {"ingredient": r.ingredient, "diet": r.diet,
+                 "convives": list(shares[r.diet].convives) if r.diet in shares else [],
+                 "replace": r.substitution.source, "with": r.substitution.target,
+                 "reason": r.substitution.reason,
+                 "confidence": round(r.substitution.confidence, 2),
+                 "fallback": r.substitution.is_fallback}
+                for r in repairs
+            ],
+            "unrepaired": [
+                {"ingredient": u.ingredient, "diet": u.diet,
+                 "convive": u.convive, "reason": u.reason}
+                for u in unrepaired
+            ],
+        })
+
+    from cooking_manager.preferences import (
+        check_preferences,
+        load_rules,
+        meals_without_protein,
+    )
+
+    name_of = {pid: name for name, pid in person_ids.items()}
+    counted_meals = []
+    for m in judged_rows:
+        lines = lines_by_meal.get(m["meal_id"], [])
+        parts: dict[str, list[str]] = {}
+        for line in lines:
+            if line.get("for_person_id") is not None:
+                who = name_of.get(line["for_person_id"], str(line["for_person_id"]))
+                parts.setdefault(who, []).append(str(line.get("name") or ""))
+        household = [str(line.get("name") or "") for line in lines
+                     if line.get("for_person_id") is None]
+        counted_meals.append(
+            {"day": m["day_label"], "slot": m["slot"], "dish": m["dish"],
+             "match_kind": m["match_kind"], "parts": parts,
+             "ingredients": household if lines else list(m["ingredients"] or [])})
+    prefs = check_preferences(counted_meals, load_rules(pref_rows), vocabulary)
+    no_protein = meals_without_protein(counted_meals)
+
+    return {
+        "slug": menu_slug, "title": menu_title,
+        "leftovers_unsourced": unsourced,
+        "parts_unmentioned": unmentioned,
+        "meals_checked": len(checked), "conflicts": conflict_count,
+        "conflicts_uncovered": uncovered_count, "repairs": repair_count,
+        "convives_known": len(convives),
+        "preferences": [p.as_dict() for p in prefs],
+        "preferences_breached": sum(1 for p in prefs if p.breached),
+        "preferences_unmeasurable": sum(1 for p in prefs if not p.measurable),
+        "meals_without_protein": no_protein,
+        "weeknight_too_heavy": too_heavy,
+        "results": checked,
+    }
+
+async def _pantry_from_db():
+    """Build a Pantry from the DB (source of truth since Phase 1)."""
+    from cooking_manager.pantry import Pantry, PantryItem
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name, name_normalized, section, qty_text, qty_value, unit,
+                      status, xstatus, entered_at, food_key
+                 FROM pantry_item ORDER BY section, name"""
+        )
+        meta = await conn.fetchrow(
+            "SELECT MAX(updated_at) AS last_updated FROM pantry_item"
+        )
+        alias_rows = await conn.fetch(
+            "SELECT alias_normalized, target_normalized FROM pantry_alias"
+        )
+        staples = frozenset(r["key"] for r in await conn.fetch(
+            "SELECT key FROM food WHERE pantry_staple"))
+
+    last = meta["last_updated"]
+    updated = last.date() if last and hasattr(last, "date") else last
+
+    items = []
+    for r in rows:
+        items.append(PantryItem(
+            item_id=r["id"],
+            rayon=r["section"],
+            name=r["name"],
+            name_normalized=r["name_normalized"],
+            qty_text=r["qty_text"] or "",
+            qty_value=float(r["qty_value"]) if r["qty_value"] is not None else None,
+            unit=r["unit"],
+            status=r["status"],
+            xstatus=r["xstatus"] or "ok",
+            entered_at=r["entered_at"],
+            food_key=r["food_key"],
+        ))
+
+    by_key = {i.name_normalized: i.item_id for i in items if i.item_id is not None}
+    aliases = {
+        r["alias_normalized"]: by_key[r["target_normalized"]]
+        for r in alias_rows
+        if r["target_normalized"] in by_key
+    }
+    return Pantry(items=items, updated=updated, aliases=aliases, staples=staples)
+
+@app.get("/api/pantry")
+async def get_pantry():
+    """Inventaire depuis la DB, groupé par rayon."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name, name_normalized, section, qty_text, qty_value, unit,
+                      status, xstatus, perishable, entered_at, source,
+                      shopping_product_id, notes, updated_at
+                 FROM pantry_item ORDER BY section, name"""
+        )
+        meta = await conn.fetchrow(
+            "SELECT MAX(updated_at) AS last_updated, COUNT(*) AS total FROM pantry_item"
+        )
+        link = await conn.fetchrow(
+            """SELECT COUNT(*) FILTER (WHERE food_key IS NOT NULL) AS linked,
+                      COUNT(*) AS total
+                 FROM pantry_item"""
+        )
+
+    last_updated = meta["last_updated"]
+    age_days = None
+    is_stale = False
+    if last_updated:
+        age_days = (datetime.datetime.now(datetime.timezone.utc) - last_updated).days
+        is_stale = age_days > 14
+
+    rayons: dict[str, list] = {}
+    for r in rows:
+        rayons.setdefault(r["section"], []).append({
+            "id": r["id"],
+            "name": r["name"],
+            "name_normalized": r["name_normalized"],
+            "qty_text": r["qty_text"],
+            "qty_value": float(r["qty_value"]) if r["qty_value"] is not None else None,
+            "unit": r["unit"],
+            "status": r["status"],
+            "xstatus": r["xstatus"],
+            "perishable": r["perishable"],
+            "entered_at": r["entered_at"].isoformat() if r["entered_at"] else None,
+            "source": r["source"],
+            "notes": r["notes"],
+        })
+
+    return {
+        "updated": last_updated.isoformat() if last_updated else None,
+        "age_days": age_days,
+        "is_stale": is_stale,
+        "total": meta["total"],
+        "food_link": food_link_counts(link["linked"], link["total"]),
+        "rayons": [{"name": k, "items": v} for k, v in rayons.items()],
+    }
+
+@app.get("/api/menus/{slug}/shopping-list")
+async def menu_shopping_list(
+    slug: str, covers: int | None = None, from_date: str | None = None,
+):
+    """Menu → liste de courses différentielle, groupée par recette."""
+    from cooking_manager.pantry import (
+        build_needs,
+        check_needs,
+        staple_rule_applies,
+        staples_undeclared,
+        staples_unlinked,
+    )
+    from cooking_manager.packing import pack_plan
+    from cooking_manager.parts import (
+        apply_repairs,
+        declared_diets,
+        eaters_by_meal,
+        portions,
+        shares_for,
+    )
+    from cooking_manager.purchase import purchase_for
+    from cooking_manager.substitutions import (
+        Discovery,
+        detect_context,
+        diets_at_table,
+        fallback_repairs,
+        prefer_discovered,
+        repair_ingredients,
+    )
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu = await conn.fetchrow(
+            "SELECT slug, title, meals FROM menu WHERE slug = $1", slug)
+        if not menu:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        person_ids = await _person_ids(conn)
+
+        date_filter = ""
+        params: list = [slug]
+        if from_date:
+            date_filter = " AND (mm.day IS NULL OR mm.day >= $2)"
+            params.append(datetime.date.fromisoformat(from_date))
+
+        rows = await conn.fetch(
+            """SELECT mm.id AS meal_id, mm.leftovers_of, mm.slot, mm.dish, mm.day_label,
+                      mm.day, mm.match_kind, mm.covers,
+                      r.id, r.slug, r.title, r.servings
+                 FROM menu_meal mm
+                 LEFT JOIN recipe r ON r.id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)"""
+            + date_filter
+            + " ORDER BY mm.position, mm.slot",
+            *params,
+        )
+        household = await load_household_config(conn)
+        referential = await load_referential_from_db(conn)
+        meal_days = [r["day"] for r in rows if r["day"]]
+        composed = {(r["day"].isoformat(), r["slot"]) for r in rows if r["day"]}
+
+        matched, unmatched, leftovers = [], [], []
+        for row in rows:
+            if row["match_kind"] == "leftovers":
+                leftovers.append({"day": row["day_label"], "slot": row["slot"],
+                                  "dish": row["dish"]})
+            elif row["id"] is None:
+                unmatched.append({"day": row["day_label"], "slot": row["slot"],
+                                  "dish": row["dish"]})
+            else:
+                matched.append((row, row["dish"]))
+
+        ingredient_link = await conn.fetchrow(
+            """SELECT COUNT(*) FILTER (WHERE food_key IS NOT NULL) AS linked,
+                      COUNT(*) AS total
+                 FROM recipe_ingredient WHERE recipe_id = ANY($1::int[])""",
+            [r["id"] for r, _ in matched],
+        )
+
+        convives = await load_convives_from_db(conn)
+
+        from cooking_manager.convives import check_ingredients
+        from cooking_manager.presence import attendees
+
+        default_covers = covers or 4
+        at_meal = {r["meal_id"]: (attendees(r["day"], r["slot"], referential, household)
+                                  if r["day"] else []) for r in rows}
+        eaters = eaters_by_meal([
+            {"id": r["meal_id"], "leftovers_of": r["leftovers_of"],
+             "leftovers": r["match_kind"] == "leftovers", "present": at_meal[r["meal_id"]]}
+            for r in rows
+        ])
+        payload = []
+        for recipe, _dish in matched:
+            rows = await conn.fetch(
+                """SELECT name, name_normalized, qty_min, qty_max, unit,
+                          is_optional, parsed, raw, position,
+                          for_person_id, replaces_position, food_key
+                     FROM recipe_ingredient WHERE recipe_id = $1 ORDER BY position""",
+                recipe["id"],
+            )
+            present = eaters.get(recipe["meal_id"], [])
+            meal_covers = recipe["covers"] or covers
+            if meal_covers and present:
+                meal_covers += len(present) - len(at_meal[recipe["meal_id"]])
+            if not meal_covers and present:
+                meal_covers = len(present)
+            if not meal_covers:
+                meal_covers = default_covers
+
+            lines = [dict(r) for r in rows]
+            if present:
+                lines = portions(lines, recipe["servings"],
+                                 [person_ids.get(n) for n in present],
+                                 covers=meal_covers)
+                ratio = 1.0
+            else:
+                base = recipe["servings"] or meal_covers
+                ratio = meal_covers / base if base else 1.0
+            at_table = [convives[n] for n in present if n in convives]
+            shares = shares_for(at_table, meal_covers)
+            if shares and at_table:
+                step_rows = await conn.fetch(
+                    "SELECT text FROM recipe_step WHERE recipe_id = $1 ORDER BY position",
+                    recipe["id"],
+                )
+                conflicts = check_ingredients(lines, at_table, person_ids)
+                context = detect_context(
+                    recipe["title"] or "",
+                    ingredients=tuple(str(r.get("name") or r.get("raw") or "")
+                                      for r in lines),
+                    steps=tuple(str(s["text"] or "") for s in step_rows),
+                    convives=tuple(c.name for c in at_table),
+                )
+                texts = [str(r.get("raw") or r.get("name") or "") for r in lines]
+                repairs = repair_ingredients(texts, diets_at_table(conflicts), context)
+                repairs += fallback_repairs(conflicts, repairs, context)
+                found = await conn.fetch(
+                    """SELECT original_ingredient, substitute_ingredient, outcome,
+                              COALESCE(who_preferred, '') AS who_preferred
+                         FROM substitution_discovery WHERE recipe_id = $1""",
+                    recipe["id"],
+                )
+                already = declared_diets(lines, at_table, person_ids)
+                repairs = [r for r in repairs if r.diet not in already]
+                repairs, _refused = prefer_discovered(repairs, [
+                    Discovery(original=f["original_ingredient"],
+                              substitute=f["substitute_ingredient"],
+                              outcome=f["outcome"], who_preferred=f["who_preferred"])
+                    for f in found
+                ])
+                lines = apply_repairs(lines, repairs, shares)
+
+            payload.append((recipe["title"], lines, ratio))
+
+    needs = build_needs(payload)
+    pantry = await _pantry_from_db()
+    packs_by_food = await _pack_sizes_by_food([n.name_normalized for n in needs])
+
+    verdicts = check_needs(needs, pantry)
+    lines = []
+    for need, verdict in zip(needs, verdicts, strict=True):
+        buy = purchase_for(need, verdict.to_buy)
+        plan = pack_plan(buy, packs_by_food.get(need.name_normalized, []))
+        lines.append({
+            "name": need.name,
+            "name_normalized": need.name_normalized,
+            "qty": round(need.qty, 2) if need.qty is not None else None,
+            "unit": need.unit,
+            "recipes": need.recipes,
+            "shared": len(need.recipes) > 1,
+            "is_optional": need.is_optional,
+            "merged_from": need.merged_from,
+            "estimate": need.estimate,
+            "outcome": verdict.outcome,
+            "reason": verdict.reason,
+            "to_buy": verdict.to_buy,
+            "purchase": ({"kind": buy.kind, "qty": buy.qty, "unit": buy.unit,
+                          "reason": buy.reason} if buy else None),
+            "pack_plan": {"pack_known": plan.pack_known, "packs": plan.packs,
+                          "buys": plan.buys, "unit": plan.unit,
+                          "pack_size": plan.pack_size, "surplus": plan.surplus,
+                          "surplus_packs": (round(sp, 2)
+                                            if (sp := plan.surplus_packs) is not None
+                                            else None),
+                          "reason": plan.reason},
+            "assumed_empty": verdict.assumed_empty,
+            "pantry_staple": staple_rule_applies(need, pantry),
+            "declared": verdict.declared,
+            "pantry": ({"id": verdict.pantry_item.item_id,
+                        "name": verdict.pantry_item.name,
+                        "qty_text": verdict.pantry_item.qty_text,
+                        "status": verdict.pantry_item.status}
+                       if verdict.pantry_item else None),
+        })
+
+    counts: dict[str, int] = {}
+    purchase_counts: dict[str, int] = {}
+    for line in lines:
+        counts[line["outcome"]] = counts.get(line["outcome"], 0) + 1
+        buy = line["purchase"]
+        if buy:
+            purchase_counts[buy["kind"]] = purchase_counts.get(buy["kind"], 0) + 1
+
+    return {
+        "slug": menu["slug"], "title": menu["title"], "covers": covers,
+        "recipes_matched": len({r["slug"] for r, _ in matched}),
+        "meals_total": len(matched) + len(unmatched) + len(leftovers),
+        "meals_unmatched": unmatched,
+        "meals_leftovers": leftovers,
+        "pantry": {"updated": pantry.updated.isoformat() if pantry.updated else None,
+                   "age_days": pantry.age_days(), "is_stale": pantry.is_stale(),
+                   "confirmation": await _confirmation_state(menu["slug"])},
+        "counts": counts,
+        "purchase_counts": purchase_counts,
+        "bans": [ban.as_dict() for ban in await _load_bans()],
+        "slots_uncomposed": _slot_coverage(meal_days, composed, referential, household),
+        "food_link": food_link_counts(ingredient_link["linked"], ingredient_link["total"]),
+        "staples_undeclared": staples_undeclared(verdicts),
+        "staples_unlinked": staples_unlinked(needs, pantry),
+        "lines": lines,
+        "recurrent": await _recurrent_lines({ln["name_normalized"] for ln in lines}),
+    }
+
+@app.get("/api/menus/{slug}/ingredient-map")
+async def menu_ingredient_map(slug: str):
+    """Par recette : chaque ingrédient, son aliment, son stock, son panier — le doute avant le rassurant.
+
+    Sans `covers` : `verify` juge la liste par défaut, la page ne doit pas en montrer une autre.
+    """
+    from cooking_manager.ingredient_map import build_ingredient_map
+
+    shopping = await menu_shopping_list(slug)
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        meals = await conn.fetch(
+            """SELECT mm.day, mm.slot, r.id, r.slug, r.title, r.photo_url
+                 FROM menu_meal mm JOIN recipe r ON r.id = mm.recipe_id
+                WHERE mm.menu_id = (SELECT id FROM menu WHERE slug = $1)
+                ORDER BY mm.position, mm.slot""", slug)
+        ingredients = await conn.fetch(
+            """SELECT recipe_id, name, name_normalized, raw, food_key
+                 FROM recipe_ingredient WHERE recipe_id = ANY($1::int[])
+                ORDER BY recipe_id, position""", [m["id"] for m in meals])
+        refused = {r["ref"] for r in await conn.fetch(
+            """SELECT ref FROM arbitration
+                WHERE subject = 'food_key' AND status = 'settled' AND decision IS NULL""")}
+
+    by_recipe: dict[int, list[dict]] = {}
+    for row in ingredients:
+        by_recipe.setdefault(row["recipe_id"], []).append(dict(row))
+    recipes = [{"recipe_slug": m["slug"], "title": m["title"], "photo_url": m["photo_url"],
+                "day": m["day"].isoformat() if m["day"] else None, "slot": m["slot"],
+                "ingredients": by_recipe.get(m["id"], [])} for m in meals]
+
+    cart, why = await _read_real_cart()
+    verify_by_food = None
+    if cart is not None:
+        verified = await _reconcile(slug, cart)
+        verify_by_food = {e["food"]: e for e in verified["per_food"]}
+
+    built = build_ingredient_map(recipes, shopping["lines"], verify_by_food, refused)
+    return {
+        "slug": shopping["slug"], "title": shopping["title"],
+        "cart_unreadable": None if cart is not None else why,
+        "food_link": shopping["food_link"],
+        "pantry": shopping["pantry"],
+        "meals_unmatched": shopping["meals_unmatched"],
+        "meals_leftovers": shopping["meals_leftovers"],
+        "slots_uncomposed": shopping["slots_uncomposed"],
+        "to_review": built["to_review"],
+        "staples_undeclared": shopping["staples_undeclared"],
+        "staples_unlinked": shopping["staples_unlinked"],
+        "recipes": built["recipes"],
+    }
+
+def _slot_coverage(meal_days, composed, referential, household) -> dict:
+    """Créneaux avec tablée et sans repas (#89). `measured: False` = rien n'a pu être mesuré."""
+    from cooking_manager.presence import uncomposed_slots, week_grid
+
+    if not meal_days:
+        return {"measured": False, "slots": [],
+                "reason": "aucun repas daté : la tablée n'a pas pu être confrontée"}
+    lo, hi = min(meal_days), max(meal_days)
+    monday = lo - datetime.timedelta(days=lo.weekday())
+    grid = week_grid(monday, referential, household)
+    slots = [s for s in uncomposed_slots(grid, composed)
+             if lo.isoformat() <= s["date"] <= hi.isoformat()]
+    return {"measured": True, "reason": "", "slots": slots}
+
+async def _pack_sizes_by_food(names: list[str]) -> dict[str, list[dict]]:
+    """Les contenants connus, par nom d'ingrédient — via `food_key` (#155)."""
+    wanted = [n for n in names if n]
+    if not wanted:
+        return {}
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT ri.name_normalized, p.name, p.pack_count,
+                      p.pack_size_value, p.pack_size_unit, p.last_price
+                 FROM recipe_ingredient ri
+                 JOIN product p ON p.food_key = ri.food_key
+                WHERE ri.name_normalized = ANY($1::text[])
+                  AND p.pack_size_value IS NOT NULL""",
+            wanted)
+    out: dict[str, list[dict]] = {}
+    for row in rows:
+        out.setdefault(row["name_normalized"], []).append(dict(row))
+    return out
+
+async def _confirmation_state(slug: str) -> dict:
+    """Ce que le garde-manger de ce menu a vraiment été confronté, ou non (#161)."""
+    from cooking_manager.pantry import confirmation_gate
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        confirmation = await _load_pantry_confirmation(conn, slug)
+    gate = confirmation_gate(confirmation, slug)
+    return {"ok": gate["ok"], "blind": gate["blind"], "reason": gate["reason"],
+            "note": gate["note"],
+            "confirmed_at": (confirmation["confirmed_at"].isoformat()
+                             if confirmation and confirmation["confirmed_at"] else None),
+            "lines_count": confirmation["lines_count"] if confirmation else None}
+
+async def _recurrent_lines(covered: set[str]) -> list[dict]:
+    """Les achats d'habitude qu'aucun repas ne nomme (#89) — marqués `source: recurrent`."""
+    from cooking_manager.bans import recurrent_products
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT pref_type, key, value, reason, active FROM shopping_preference
+                WHERE active = TRUE AND pref_type = 'recurrent' ORDER BY key"""
+        )
+    return recurrent_products(rows, covered)
+
+class PantryConfirmLine(BaseModel):
+    """Une ligne du garde-manger regardée : `absent` et `corrected` réécrivent la base."""
+    name: str
+    verdict: str
+    qty_text: str | None = None
+    id: int | None = None
+
+PANTRY_VERDICT_STATUS = {"confirmed": None, "corrected": "ok", "absent": "out"}
+
+class PantryConfirmRequest(BaseModel):
+    lines: list[PantryConfirmLine] = []
+    blind: bool = False
+    reason: str | None = None
+
+async def _load_pantry_confirmation(conn, slug: str) -> dict | None:
+    row = await conn.fetchrow(
+        """SELECT menu_slug, confirmed_at, blind, reason, lines_count
+             FROM pantry_confirmation WHERE menu_slug = $1""", slug)
+    return dict(row) if row else None
+
+@app.post("/api/menus/{slug}/pantry-confirm")
+async def confirm_pantry(slug: str, body: PantryConfirmRequest):
+    """Le garde-manger confronté avant que le panier parte — ou déclaré à l'aveugle (#161)."""
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.pantry import entry_quantity
+
+    reason = (body.reason or "").strip()
+    if body.blind and not reason:
+        raise HTTPException(422, {
+            "error": "une confirmation à l'aveugle exige son motif",
+            "hint": "`reason` dit ce qu'on ignore — sans lui, ce n'est pas une échappatoire "
+                    "mais un contournement"})
+    if body.blind and body.lines:
+        raise HTTPException(422, {
+            "error": "`blind: true` avec des lignes : la note dirait qu'aucune ligne n'a été "
+                     "regardée alors que certaines l'ont été",
+            "hint": "confirmer les lignes vues, ou déclarer l'aveugle — pas les deux"})
+    if not body.blind and not body.lines:
+        raise HTTPException(422, {
+            "error": "aucune ligne regardée et `blind` absent",
+            "hint": "confirmer des lignes, ou déclarer `blind: true` avec son motif"})
+
+    unknown = sorted({line.verdict for line in body.lines} - set(PANTRY_VERDICT_STATUS))
+    if unknown:
+        raise HTTPException(422, {
+            "error": f"verdict inconnu : {unknown}",
+            "expected": sorted(PANTRY_VERDICT_STATUS)})
+
+    applied, refused, writes = [], [], []
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        for line in body.lines:
+            status = PANTRY_VERDICT_STATUS[line.verdict]
+            if status is None:
+                continue
+            if line.id is not None:
+                elected = list(await conn.fetch(
+                    "SELECT id, name, section, food_key FROM pantry_item WHERE id = $1",
+                    line.id))
+            else:
+                candidates = await conn.fetch(
+                    """SELECT id, name, section, food_key FROM pantry_item
+                        WHERE lower(name) = lower($1) OR name_normalized = $2
+                        ORDER BY id""",
+                    line.name, normalize_name(line.name))
+                exact = [r for r in candidates
+                         if r["name"].strip().lower() == line.name.strip().lower()]
+                elected = exact or list(candidates)
+            if not elected:
+                refused.append({"id": line.id, "name": line.name,
+                                "reason": "article introuvable au garde-manger"})
+                continue
+            if len(elected) > 1:
+                refused.append({
+                    "id": line.id,
+                    "name": line.name,
+                    "reason": f"{len(elected)} articles portent ce nom — préciser lequel",
+                    "candidates": [{"id": r["id"], "name": r["name"],
+                                    "section": r["section"]} for r in elected]})
+                continue
+            staple = await _is_staple_food(conn, elected[0]["food_key"])
+            qty_value, unit, refusal = entry_quantity(line.qty_text, status, staple=staple)
+            if refusal:
+                refused.append({"id": line.id, "name": line.name, "reason": refusal,
+                                "qty_text": line.qty_text})
+                continue
+            writes.append((elected[0]["id"], status, line.qty_text, qty_value, unit))
+
+        if refused:
+            raise HTTPException(422, {
+                "error": f"{len(refused)} ligne(s) non déclarables — rien n'a été confirmé",
+                "refused": refused})
+
+        async with conn.transaction():
+            for item_id, status, qty_text, qty_value, unit in writes:
+                written = await conn.fetchrow(
+                    """UPDATE pantry_item
+                          SET status = $2, xstatus = $2, updated_at = NOW(),
+                              qty_text = $3, qty_value = $4, unit = $5
+                        WHERE id = $1
+                    RETURNING id, name, status""",
+                    item_id, status, qty_text or "", qty_value, unit)
+                if written is None:
+                    raise HTTPException(500, f"Écriture perdue sur l'article {item_id}")
+                applied.append({"id": written["id"], "name": written["name"],
+                                "status": written["status"]})
+
+            row = await conn.fetchrow(
+                """INSERT INTO pantry_confirmation
+                       (menu_slug, confirmed_at, blind, reason, lines_count, detail)
+                   VALUES ($1, CURRENT_DATE, $2, $3, $4, $5::jsonb)
+                   ON CONFLICT (menu_slug) DO UPDATE SET
+                       confirmed_at = CURRENT_DATE, blind = EXCLUDED.blind,
+                       reason = EXCLUDED.reason, lines_count = EXCLUDED.lines_count,
+                       detail = EXCLUDED.detail, updated_at = NOW()
+                RETURNING menu_slug, confirmed_at, blind, reason, lines_count""",
+                slug, body.blind, reason or None, len(body.lines),
+                json.dumps({"applied": applied}))
+    if row is None:
+        raise HTTPException(500, f"Confirmation perdue pour le menu {slug}")
+
+    from cooking_manager.pantry import confirmation_gate
+    gate = confirmation_gate(dict(row), slug)
+    return {"menu_slug": slug, "confirmed_at": row["confirmed_at"].isoformat(),
+            "blind": row["blind"], "reason": row["reason"],
+            "lines_count": row["lines_count"], "applied": applied,
+            "note": gate["note"]}
+
+@app.get("/api/menus/{slug}/pantry-review")
+async def menu_pantry_review(slug: str):
+    """Les lignes du garde-manger dont la semaine dépend, par rayon — l'écran de revue iPad (spec 01)."""
+    from cooking_manager.pantry_review import review_lines
+
+    shopping = await menu_shopping_list(slug, from_date=gate_engine._today())
+    lines = review_lines(shopping["lines"])
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, section FROM pantry_item WHERE id = ANY($1::int[])",
+            [ln["id"] for ln in lines])
+    section_of = {r["id"]: r["section"] or "" for r in rows}
+    for ln in lines:
+        ln["section"] = section_of.get(ln["id"], "")
+    lines.sort(key=lambda ln: (ln["section"], ln["name"].lower()))
+    return {"slug": slug, "confirmation": shopping["pantry"]["confirmation"],
+            "count": len(lines), "lines": lines}
+
+@app.get("/api/menus/{slug}/mediterranean")
+async def menu_mediterranean(slug: str):
+    """Couverture du cadre méditerranéen, DÉRIVÉE de `food.kind` — ADR 0033."""
+    from cooking_manager.mediterranean import cover
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu = await conn.fetchrow(
+            "SELECT id, slug, title FROM menu WHERE slug = $1", slug)
+        if not menu:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        dated = await conn.fetchval(
+            "SELECT count(*) FROM menu_meal WHERE menu_id = $1 AND day IS NOT NULL",
+            menu["id"])
+        link = await conn.fetchrow(
+            """SELECT COUNT(*) FILTER (WHERE ri.food_key IS NOT NULL) AS linked,
+                      COUNT(*) AS total
+                 FROM menu_meal mm
+                 JOIN recipe_ingredient ri ON ri.recipe_id = mm.recipe_id
+                WHERE mm.menu_id = $1""", menu["id"])
+        rows = await conn.fetch(
+            """SELECT mm.day, f.kind
+                 FROM menu_meal mm
+                 JOIN recipe_ingredient ri ON ri.recipe_id = mm.recipe_id
+                 JOIN food f ON f.key = ri.food_key
+                WHERE mm.menu_id = $1 AND mm.day IS NOT NULL
+                  AND f.kind IS NOT NULL""", menu["id"])
+
+    kinds_by_day: dict[str, set[str]] = {}
+    for row in rows:
+        kinds_by_day.setdefault(row["day"].isoformat(), set()).add(row["kind"])
+
+    food_link = food_link_counts(link["linked"], link["total"])
+    read = cover(kinds_by_day)
+    measured = bool(kinds_by_day)
+    return {
+        "slug": menu["slug"], "title": menu["title"],
+        "measured": measured,
+        "reason": "" if measured else _mediterranean_wall(dated, food_link),
+        "food_link": food_link,
+        "out_of_reach": read["out_of_reach"],
+        "criteria": read["criteria"] if measured else [],
+        "days": read["days"] if measured else [],
+    }
+
+def _mediterranean_wall(dated: int, food_link: dict) -> str:
+    """Le mur exact sur lequel la dérivation s'est arrêtée — jamais « critère non tenu »."""
+    if not dated:
+        return "aucun repas daté : la couverture n'a pas de journée où se mesurer"
+    if not food_link["linked"]:
+        return (f"aucun ingrédient rattaché à un aliment ({food_link['linked']} "
+                f"sur {food_link['total']}) : la couverture ne se dérive de rien")
+    return (f"{food_link['linked']} ingrédient(s) rattaché(s), mais aucun aliment "
+            "ne porte de famille (`food.kind`)")
+
+@app.get("/api/menus/{slug}/nutrition")
+async def menu_nutrition(slug: str):
+    """Le menu face à la cible macros. Ne conclut PAS tant qu'un ingrédient manque — ADR 0033."""
+    from cooking_manager import nutrition as nut
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu = await conn.fetchrow(
+            "SELECT id, slug, title FROM menu WHERE slug = $1", slug)
+        if not menu:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        target_row = await conn.fetchrow(
+            """SELECT t.*, COALESCE(p.name, '') AS person,
+                      (CURRENT_DATE - t.since) AS age_days
+                 FROM nutrition_target t
+                 LEFT JOIN person p ON p.id = t.person_id
+                ORDER BY t.id LIMIT 1""")
+        meals = await conn.fetch(
+            """SELECT mm.day, mm.slot, mm.dish, mm.match_kind,
+                      r.id AS recipe_id, r.servings
+                 FROM menu_meal mm
+                 LEFT JOIN recipe r ON r.id = mm.recipe_id
+                WHERE mm.menu_id = $1 AND mm.day IS NOT NULL
+                ORDER BY mm.day, mm.position""", menu["id"])
+        ingredients = await conn.fetch(
+            """SELECT DISTINCT ri.recipe_id, ri.position, ri.raw, ri.name,
+                      ri.name_normalized, ri.qty_min, ri.unit, ri.is_optional
+                 FROM menu_meal mm
+                 JOIN recipe_ingredient ri ON ri.recipe_id = mm.recipe_id
+                WHERE mm.menu_id = $1
+                ORDER BY ri.recipe_id, ri.position""", menu["id"])
+
+    by_recipe: dict[int, list[dict]] = {}
+    for row in ingredients:
+        by_recipe.setdefault(row["recipe_id"], []).append(dict(row))
+
+    target = _nutrition_target(target_row)
+    base = await _load_food_base_from_db()
+    computed: dict[int, nut.RecipeMacros] = {}
+    days: dict[str, dict] = {}
+    for meal in meals:
+        day = days.setdefault(meal["day"].isoformat(), {
+            "day": meal["day"].isoformat(), "meals": 0, "counted": 0,
+            "kcal": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "missing": []})
+        day["meals"] += 1
+        if meal["recipe_id"] is None:
+            day["missing"].append({
+                "slot": meal["slot"], "dish": meal["dish"],
+                "reason": ("repas de restes, sans fiche" if meal["match_kind"] == "leftovers"
+                           else "aucune fiche rattachée")})
+            continue
+        result = computed.get(meal["recipe_id"])
+        if result is None:
+            result = nut.recipe_macros(by_recipe.get(meal["recipe_id"], []), base)
+            computed[meal["recipe_id"]] = result
+        servings = meal["servings"] or 1
+        for macro in nut.TARGET_MACROS:
+            day[macro] += getattr(result, macro) / servings
+        day["counted"] += 1
+        day["missing"] += [
+            {"slot": meal["slot"], "dish": meal["dish"],
+             "ingredient": item.name, "reason": item.reason}
+            for item in result.unresolved
+        ]
+
+    payload = []
+    for day in days.values():
+        totals = {macro: round(day[macro], 1) for macro in nut.TARGET_MACROS}
+        verdict = (nut.against_target(totals, target)
+                   if target is not None and not day["missing"] else None)
+        payload.append({**day, **totals, "verdict": verdict})
+
+    in_range = [d for d in payload
+                if d["verdict"] and set(d["verdict"].values()) == {"in_range"}]
+    conclusive = bool(payload) and all(d["verdict"] for d in payload)
+    return {
+        "slug": menu["slug"], "title": menu["title"],
+        "reading": "une part de chaque repas ; `servings` n'est pas homogène d'une fiche à l'autre (#116)",
+        "target": target,
+        "verdict": ({"days_in_range": len(in_range), "days_total": len(payload)}
+                    if conclusive else None),
+        "reason": "" if conclusive else _nutrition_wall(target, payload),
+        "days": payload,
+    }
+
+def _nutrition_target(row) -> dict | None:
+    """La cible telle qu'elle est écrite. `age_days` se lit, il ne se juge pas."""
+    if row is None:
+        return None
+    target = {f"{macro}_{bound}": (None if row[f"{macro}_{bound}"] is None
+                                  else float(row[f"{macro}_{bound}"]))
+              for macro in ("kcal", "protein", "carbs", "fat")
+              for bound in ("min", "max")}
+    target.update(person=row["person"], source=row["source"],
+                  since=row["since"].isoformat(), age_days=row["age_days"])
+    return target
+
+def _nutrition_wall(target: dict | None, days: list[dict]) -> str:
+    """Pourquoi la lecture ne conclut pas — nommé, jamais un verdict de repli."""
+    if target is None:
+        return "aucune cible en base : il n'y a rien à confronter"
+    if not days:
+        return "aucun repas daté : la journée n'a pas de contenu à compter"
+    blocked = sum(len(d["missing"]) for d in days)
+    return (f"{blocked} manque(s) sur {len(days)} journée(s) : un ingrédient non compté "
+            "rendrait la somme plus basse qu'elle n'est")
+
+class PantryUpdate(BaseModel):
+    """Un des 4 gestes du différentiel garde-manger."""
+    item_name: str
+    action: str
+    qty_text: str | None = None
+
+PANTRY_ACTION_STATUS = {"have": "ok", "missing": "out", "partial": "low", "update": "ok"}
+
+@app.patch("/api/pantry")
+async def update_pantry(body: PantryUpdate):
+    """Déclare l'état d'un article du garde-manger, désigné par son nom."""
+    if body.action not in PANTRY_ACTION_STATUS:
+        raise HTTPException(
+            400, f"action inconnue : {body.action} (attendu {sorted(PANTRY_ACTION_STATUS)})")
+    if body.action == "update" and not body.qty_text:
+        raise HTTPException(400, "`qty_text` est requis pour l'action `update`")
+
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.pantry import entry_quantity
+
+    status = PANTRY_ACTION_STATUS[body.action]
+    wanted = body.item_name.strip()
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name, qty_text, status, section, entered_at, food_key
+                 FROM pantry_item
+                WHERE lower(name) = lower($1) OR name_normalized = $2
+                ORDER BY id""",
+            wanted, normalize_name(wanted))
+        if not rows:
+            raise HTTPException(404, f"Article introuvable au garde-manger : {wanted}")
+
+        exact = [r for r in rows if r["name"].strip().lower() == wanted.lower()]
+        candidates = exact or list(rows)
+        if len(candidates) > 1:
+            raise HTTPException(409, {
+                "error": f"{len(candidates)} articles portent ce nom — préciser lequel",
+                "hint": "Reprendre le `name` exact d'un candidat, ou passer par "
+                        "PUT /api/pantry/items/{id}",
+                "candidates": [
+                    {"id": r["id"], "name": r["name"], "qty_text": r["qty_text"],
+                     "section": r["section"], "status": r["status"]}
+                    for r in candidates],
+            })
+
+        before = candidates[0]
+        staple = await _is_staple_food(conn, before["food_key"])
+        qty_value, unit, refusal = entry_quantity(body.qty_text, status, staple=staple)
+        if refusal:
+            raise HTTPException(422, {"error": refusal, "item_name": body.item_name,
+                                      "qty_text": body.qty_text})
+        after = await conn.fetchrow(
+            """UPDATE pantry_item
+                  SET status = $2,
+                      xstatus = $2,
+                      qty_text = $3,
+                      qty_value = $4,
+                      unit = $5,
+                      updated_at = NOW()
+                WHERE id = $1
+            RETURNING id, name, qty_text, qty_value, unit, status, xstatus""",
+            before["id"], status, body.qty_text or "", qty_value, unit)
+
+    if after is None:
+        raise HTTPException(500, f"Écriture perdue sur l'article {before['id']}")
+
+    return {
+        "changed": before["status"] != after["status"] or bool(body.qty_text),
+        "id": after["id"],
+        "name": after["name"],
+        "before": {"status": before["status"], "qty_text": before["qty_text"]},
+        "after": {"status": after["status"], "xstatus": after["xstatus"],
+                  "qty_text": after["qty_text"],
+                  "qty_value": float(after["qty_value"]) if after["qty_value"] is not None else None,
+                  "unit": after["unit"]},
+    }
+
+class PantryItemCreate(BaseModel):
+    name: str
+    section: str
+    qty_text: str = ""
+    status: str = "ok"
+    entered_at: datetime.date | None = None
+    source: str = "manual"
+    notes: str | None = None
+
+class PantryItemUpdate(BaseModel):
+    name: str | None = None
+    section: str | None = None
+    qty_text: str | None = None
+    status: str | None = None
+    xstatus: str | None = None
+    entered_at: datetime.date | None = None
+    notes: str | None = None
+
+@app.post("/api/pantry/items")
+async def create_pantry_item(body: PantryItemCreate):
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.pantry import XSTATUS_MAP, entry_quantity, is_perishable_section
+
+    name_normalized = normalize_name(body.name)
+    if not name_normalized:
+        raise HTTPException(400, "Nom vide après normalisation")
+
+    xstatus = body.status
+    status = XSTATUS_MAP.get(xstatus, body.status)
+    perishable = is_perishable_section(body.section)
+    qty_value, unit, refusal = entry_quantity(body.qty_text, status)
+    if refusal:
+        raise HTTPException(422, {"error": refusal, "name": body.name,
+                                  "qty_text": body.qty_text})
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """INSERT INTO pantry_item
+                   (name, name_normalized, section, qty_text, qty_value, unit,
+                    status, xstatus, perishable, entered_at, source, notes)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                   RETURNING id, name, section, qty_value, unit, status""",
+                body.name, name_normalized, body.section, body.qty_text,
+                qty_value, unit, status, xstatus, perishable,
+                body.entered_at or datetime.date.today(), body.source, body.notes,
+            )
+        except Exception as e:
+            if "unique" in str(e).lower():
+                raise HTTPException(
+                    409, f"Item déjà existant : {body.name} dans {body.section}"
+                ) from None
+            raise
+    return _round_numeric(dict(row))
+
+@app.get("/api/pantry/items/{item_id}")
+async def get_pantry_item(item_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM pantry_item WHERE id = $1", item_id)
+    if not row:
+        raise HTTPException(404, f"Item introuvable : {item_id}")
+    d = dict(row)
+    _serialize_dates(d, ("entered_at", "created_at", "updated_at"))
+    return d
+
+@app.put("/api/pantry/items/{item_id}")
+async def update_pantry_item(item_id: int, body: PantryItemUpdate):
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.pantry import XSTATUS_MAP, is_perishable_section
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT * FROM pantry_item WHERE id = $1", item_id)
+        if not existing:
+            raise HTTPException(404, f"Item introuvable : {item_id}")
+
+        name = body.name or existing["name"]
+        section = body.section or existing["section"]
+        qty_text = body.qty_text if body.qty_text is not None else existing["qty_text"]
+        xstatus = body.xstatus or body.status or existing["xstatus"]
+        status = XSTATUS_MAP.get(xstatus, xstatus)
+        entered_at = body.entered_at or existing["entered_at"]
+        notes = body.notes if body.notes is not None else existing["notes"]
+
+        from cooking_manager.pantry import QUANTIFIED_STATUSES, entry_quantity
+
+        declares_quantity = body.qty_text is not None
+        enters_stock = (status in QUANTIFIED_STATUSES
+                        and existing["status"] not in QUANTIFIED_STATUSES)
+        staple = await _is_staple_food(conn, existing["food_key"])
+        qty_value, unit, refusal = entry_quantity(qty_text, status, staple=staple)
+        if refusal and (declares_quantity or enters_stock):
+            raise HTTPException(422, {"error": refusal, "id": item_id,
+                                      "name": name, "qty_text": qty_text})
+        if refusal:
+            qty_value, unit = (float(existing["qty_value"])
+                               if existing["qty_value"] is not None else None), existing["unit"]
+        perishable = is_perishable_section(section)
+
+        await conn.execute(
+            """UPDATE pantry_item SET
+                   name=$1, name_normalized=$2, section=$3, qty_text=$4,
+                   qty_value=$5, unit=$6, status=$7, xstatus=$8,
+                   perishable=$9, entered_at=$10, notes=$11, updated_at=NOW()
+               WHERE id=$12""",
+            name, normalize_name(name), section, qty_text,
+            float(qty_value) if qty_value is not None else None, unit,
+            status, xstatus, perishable, entered_at, notes, item_id,
+        )
+
+    return {"id": item_id, "name": name, "status": status, "updated": True}
+
+@app.delete("/api/pantry/items/{item_id}")
+async def delete_pantry_item(item_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM pantry_item WHERE id = $1 RETURNING id, name", item_id
+        )
+    if not row:
+        raise HTTPException(404, f"Item introuvable : {item_id}")
+    return {"deleted": row["name"], "id": row["id"]}
+
+class PantryBulkItem(BaseModel):
+    name: str
+    section: str = "Frais — Légumes & Fruits"
+    qty_text: str = ""
+    entered_at: datetime.date | None = None
+    source: str = "voice"
+
+@app.post("/api/pantry/bulk")
+async def bulk_upsert_pantry(items: list[PantryBulkItem]):
+    """Upsert a batch of pantry items (vocal bulk inventory)."""
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.pantry import STATUS_OK, entry_quantity, is_perishable_section
+
+    if not items:
+        raise HTTPException(400, "Liste vide")
+    if len(items) > 50:
+        raise HTTPException(400, "50 items maximum par batch")
+
+    pool = await get_pool(DATABASE_DSN)
+    results = []
+    async with pool.acquire() as conn:
+        for item in items:
+            name_normalized = normalize_name(item.name)
+            if not name_normalized:
+                results.append({"name": item.name, "status": "skipped", "reason": "nom vide"})
+                continue
+
+            qty_value, unit, refusal = entry_quantity(item.qty_text, STATUS_OK)
+            if refusal:
+                results.append({"name": item.name, "section": item.section,
+                                "status": "rejected", "reason": refusal,
+                                "qty_text": item.qty_text})
+                continue
+            perishable = is_perishable_section(item.section)
+
+            existing = await conn.fetchrow(
+                "SELECT id FROM pantry_item WHERE name_normalized = $1 AND section = $2",
+                name_normalized, item.section,
+            )
+            if existing:
+                await conn.execute(
+                    """UPDATE pantry_item SET
+                           qty_text=$1, qty_value=$2, unit=$3, status='ok', xstatus='ok',
+                           perishable=$4, updated_at=NOW(), source=$5,
+                           entered_at=COALESCE($6, entered_at)
+                       WHERE id=$7""",
+                    item.qty_text,
+                    float(qty_value) if qty_value is not None else None,
+                    unit, perishable, item.source, item.entered_at, existing["id"],
+                )
+                results.append({
+                    "id": existing["id"], "name": item.name,
+                    "section": item.section, "status": "updated",
+                })
+            else:
+                row = await conn.fetchrow(
+                    """INSERT INTO pantry_item
+                       (name, name_normalized, section, qty_text, qty_value, unit,
+                        status, xstatus, perishable, entered_at, source)
+                       VALUES ($1,$2,$3,$4,$5,$6,'ok','ok',$7,$8,$9)
+                       RETURNING id""",
+                    item.name, name_normalized, item.section, item.qty_text,
+                    float(qty_value) if qty_value is not None else None,
+                    unit, perishable, item.entered_at or datetime.date.today(),
+                    item.source,
+                )
+                results.append({
+                    "id": row["id"], "name": item.name,
+                    "section": item.section, "status": "created",
+                })
+
+    created = sum(1 for r in results if r.get("status") == "created")
+    updated = sum(1 for r in results if r.get("status") == "updated")
+    rejected = [r for r in results if r.get("status") == "rejected"]
+    return {"results": results, "created": created, "updated": updated,
+            "rejected": len(rejected), "rejected_names": [r["name"] for r in rejected]}
+
+class StapleState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str
+    item_id: int | None = None
+
+STAPLE_SECTION = "Fond de cuisine"
+TRASH_SECTION = "À jeter / périmés"
+LIVE_STATUSES = ["ok", "low"]
+
+@app.put("/api/pantry/staples/{food_key}")
+async def set_staple(food_key: str, body: StapleState):
+    """Un basique se déclare par aliment, sur la ligne lue par le verdict plutôt qu'un homonyme créé à côté (ADR 0043)."""
+    from cooking_manager.ingredients import normalize_name
+
+    if body.status not in ("ok", "out"):
+        raise HTTPException(422, f"statut {body.status!r} : un basique est 'ok' ou 'out'")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        food = await conn.fetchrow(
+            "SELECT key, name, pantry_staple FROM food WHERE key = $1", food_key)
+        if food is None:
+            raise HTTPException(404, f"Aliment introuvable : {food_key}")
+        if not food["pantry_staple"]:
+            raise HTTPException(422, f"{food_key} n'est pas un basique du placard : sa quantité se déclare")
+        name_normalized = normalize_name(food["name"])
+        async with conn.transaction():
+            if body.item_id is not None:
+                await conn.execute(
+                    "UPDATE pantry_item SET food_key = $1 WHERE id = $2 AND food_key IS NULL",
+                    food_key, body.item_id)
+            await conn.execute(
+                """UPDATE pantry_item SET food_key = $1
+                    WHERE food_key IS NULL AND name_normalized = ANY($2::text[])""",
+                food_key, [name_normalized, food_key])
+            if body.status == "out":
+                updated = [r["id"] for r in await conn.fetch(
+                    """UPDATE pantry_item SET status = 'out', xstatus = 'out', updated_at = NOW()
+                        WHERE food_key = $1 AND status = ANY($2::text[]) RETURNING id""",
+                    food_key, LIVE_STATUSES)]
+            else:
+                updated = [r["id"] for r in await conn.fetch(
+                    """UPDATE pantry_item SET status = 'ok', xstatus = 'ok', updated_at = NOW()
+                        WHERE food_key = $1 AND status = ANY($2::text[]) RETURNING id""",
+                    food_key, LIVE_STATUSES)]
+                if not updated:
+                    updated = [r["id"] for r in await conn.fetch(
+                        """WITH dead AS (SELECT id, updated_at FROM pantry_item
+                                          WHERE food_key = $1 AND status = 'out' AND xstatus = 'out'
+                                            AND section <> $2)
+                           UPDATE pantry_item SET status = 'ok', xstatus = 'ok', updated_at = NOW()
+                            WHERE id IN (SELECT id FROM dead WHERE updated_at IS NOT DISTINCT FROM
+                                           (SELECT updated_at FROM dead
+                                             ORDER BY updated_at DESC NULLS LAST LIMIT 1))
+                        RETURNING id""", food_key, TRASH_SECTION)]
+            created = None
+            if not updated:
+                created = await conn.fetchval(
+                    """INSERT INTO pantry_item (name, name_normalized, section, qty_text, status,
+                                                xstatus, perishable, entered_at, source, food_key)
+                       VALUES ($1, $2, $3, '', $4, $4, FALSE, CURRENT_DATE, 'staple', $5)
+                       ON CONFLICT (name_normalized, section) DO UPDATE
+                          SET status = EXCLUDED.status, xstatus = EXCLUDED.status,
+                              food_key = EXCLUDED.food_key, updated_at = NOW()
+                        WHERE pantry_item.food_key IS NULL OR pantry_item.food_key = EXCLUDED.food_key
+                       RETURNING id""",
+                    food["name"], name_normalized, STAPLE_SECTION, body.status, food_key)
+                if created is None:
+                    raise HTTPException(409, {
+                        "error": f"« {food['name']} » existe déjà dans {STAPLE_SECTION} pour un autre aliment",
+                        "hint": "rattacher ou renommer cette ligne au garde-manger"})
+    return {"food_key": food_key, "status": body.status, "updated": updated, "created": created}
+
+@app.get("/api/pantry/search")
+async def search_pantry(q: str = Query(..., min_length=1)):
+    """Recherche dans le garde-manger par nom (partiel, insensible à la casse)."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name, name_normalized, section, qty_text, status, xstatus,
+                      perishable, entered_at, source, notes
+                 FROM pantry_item
+                WHERE name ILIKE $1 OR name_normalized ILIKE $1
+             ORDER BY name LIMIT 20""",
+            f"%{q}%",
+        )
+    return {"results": [dict(r) for r in rows], "total": len(rows)}
+
+class AliasBody(BaseModel):
+    ingredient: str
+    pantry_item: str
+
+@app.get("/api/pantry/aliases")
+async def list_pantry_aliases():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT a.id, a.alias_normalized, a.target_normalized,
+                      p.name AS pantry_item
+                 FROM pantry_alias a
+                 LEFT JOIN pantry_item p ON p.name_normalized = a.target_normalized
+             ORDER BY a.alias_normalized"""
+        )
+    return {"aliases": [dict(r) for r in rows]}
+
+@app.post("/api/pantry/aliases", status_code=201)
+async def add_pantry_alias(body: AliasBody):
+    """Relie un ingrédient à un article du stock quand aucune règle ne peut trancher."""
+    from cooking_manager.ingredients import normalize_name
+    key = normalize_name(body.ingredient)
+    if not key:
+        raise HTTPException(422, "ingrédient vide après normalisation")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        target = await conn.fetchrow(
+            """SELECT id, name, name_normalized FROM pantry_item
+                WHERE name = $1 OR name_normalized = $2
+             ORDER BY length(name) LIMIT 1""",
+            body.pantry_item, normalize_name(body.pantry_item),
+        )
+        if not target:
+            raise HTTPException(404, f"Article introuvable au garde-manger : {body.pantry_item}")
+        row = await conn.fetchrow(
+            """INSERT INTO pantry_alias (alias_normalized, pantry_item_id, target_normalized)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (alias_normalized) DO UPDATE
+               SET pantry_item_id = EXCLUDED.pantry_item_id,
+                   target_normalized = EXCLUDED.target_normalized
+               RETURNING id""",
+            key, target["id"], target["name_normalized"],
+        )
+    return {"ok": True, "alias_id": row["id"], "alias": key, "pantry_item": target["name"]}
+
+@app.delete("/api/pantry/aliases/{alias_id}", status_code=204)
+async def delete_pantry_alias(alias_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM pantry_alias WHERE id = $1", alias_id)
+    if result == "DELETE 0":
+        raise HTTPException(404, "Alias introuvable")
+
+@app.post("/api/pantry/renormalize")
+async def renormalize_pantry(dry_run: bool = False):
+    """Recalcule les clés d'appariement du garde-manger avec la normalisation courante."""
+    from cooking_manager.ingredients import normalize_name
+    pool = await get_pool(DATABASE_DSN)
+    changed: list[dict] = []
+    async with pool.acquire() as conn:
+        for table, name_col, key_col in (
+            ("pantry_item", "name", "name_normalized"),
+            ("pantry_alias", "alias_normalized", "alias_normalized"),
+            ("pantry_alias", "target_normalized", "target_normalized"),
+        ):
+            rows = await conn.fetch(f"SELECT id, {name_col} AS src, {key_col} AS key FROM {table}")
+            for row in rows:
+                fresh = normalize_name(row["src"] or "")
+                if not fresh or fresh == row["key"]:
+                    continue
+                changed.append({"table": table, "id": row["id"],
+                                "before": row["key"], "after": fresh})
+                if not dry_run:
+                    await conn.execute(
+                        f"UPDATE {table} SET {key_col} = $1 WHERE id = $2", fresh, row["id"],
+                    )
+    return {"dry_run": dry_run, "changed": len(changed), "samples": changed[:15]}
+
+@app.get("/api/menus/{slug}/meals")
+async def list_menu_meals(slug: str):
+    """Liste des repas structurés du menu, avec leur id pour édition."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu = await conn.fetchrow("SELECT id FROM menu WHERE slug = $1", slug)
+        if not menu:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        rows = await conn.fetch(
+            """SELECT mm.id, mm.day, mm.day_label, mm.position, mm.slot,
+                      mm.dish, mm.recipe_id, mm.match_kind, mm.covers, mm.served,
+                      mm.leftovers_of,
+                      r.slug AS recipe_slug, r.title AS recipe_title,
+                      r.photo_url AS recipe_photo
+                 FROM menu_meal mm
+                 LEFT JOIN recipe r ON r.id = mm.recipe_id
+                WHERE mm.menu_id = $1
+             ORDER BY mm.position, mm.slot""",
+            menu["id"],
+        )
+        household = await load_household_config(conn)
+        referential = await load_referential_from_db(conn)
+    from cooking_manager.parts import eaters_by_meal, meal_portions
+    from cooking_manager.presence import attendees
+
+    table = [{"id": r["id"], "leftovers_of": r["leftovers_of"], "covers": r["covers"],
+              "leftovers": r["match_kind"] == "leftovers",
+              "present": (attendees(r["day"], r["slot"], referential, household)
+                          if r["day"] else [])}
+             for r in rows]
+    counts = meal_portions(table)
+    eaters = eaters_by_meal(table)
+    meals = []
+    for r in rows:
+        d = dict(r)
+        d["portions"] = counts.get(r["id"])
+        d["eaters"] = eaters.get(r["id"], [])
+        if d.get("day") and hasattr(d["day"], "isoformat"):
+            d["day"] = d["day"].isoformat()
+        meals.append(d)
+    return {"slug": slug, "meals": meals}
+
+class ServedBody(BaseModel):
+    served: bool | None
+    day: datetime.date | None = None
+    slot: str | None = None
+    position: int | None = None
+
+@app.post("/api/menus/{slug}/served")
+async def set_meals_served(slug: str, body: ServedBody):
+    """Marque des repas mangés, pas faits, ou de nouveau inconnus (served = null)."""
+    from cooking_manager.presence import SLOTS
+    if body.slot is not None and body.slot not in SLOTS:
+        raise HTTPException(422, f"Créneau inconnu : {body.slot}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu = await conn.fetchrow("SELECT id FROM menu WHERE slug = $1", slug)
+        if not menu:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        rows = await conn.fetch(
+            """UPDATE menu_meal SET served = $2
+                WHERE menu_id = $1
+                  AND ($3::date IS NULL OR day = $3)
+                  AND ($4::text IS NULL OR slot = $4)
+                  AND ($5::int IS NULL OR position = $5)
+            RETURNING id""",
+            menu["id"], body.served, body.day, body.slot, body.position,
+        )
+    return {"ok": True, "slug": slug, "served": body.served, "updated": len(rows)}
+
+class MealUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recipe_slug: str | None = None
+    dish: str | None = None
+    covers: int | None = None
+
+@app.patch("/api/menus/{slug}/meals/{meal_id}")
+async def update_menu_meal(slug: str, meal_id: int, body: MealUpdate):
+    """Changer la recette, l'intitulé et/ou le nombre de couverts d'un repas."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        menu = await conn.fetchrow("SELECT id FROM menu WHERE slug = $1", slug)
+        if not menu:
+            raise HTTPException(404, f"Menu introuvable : {slug}")
+        meal = await conn.fetchrow(
+            "SELECT id, dish, covers FROM menu_meal WHERE id = $1 AND menu_id = $2",
+            meal_id, menu["id"],
+        )
+        if not meal:
+            raise HTTPException(404, f"Repas introuvable : {meal_id}")
+
+        current = await conn.fetchrow(
+            "SELECT recipe_id, match_kind FROM menu_meal WHERE id = $1", meal_id,
+        )
+        recipe_id = current["recipe_id"]
+        match_kind = current["match_kind"]
+        dish = meal["dish"]
+
+        if body.recipe_slug:
+            recipe = await conn.fetchrow(
+                "SELECT id, title FROM recipe WHERE slug = $1", body.recipe_slug,
+            )
+            if not recipe:
+                raise HTTPException(404, f"Recette introuvable : {body.recipe_slug}")
+            recipe_id = recipe["id"]
+            match_kind = "manual"
+            dish = body.dish or recipe["title"]
+        elif body.dish:
+            dish = body.dish
+
+        if body.covers is not None:
+            await conn.execute(
+                "UPDATE menu_meal SET covers = $1 WHERE id = $2",
+                body.covers, meal_id,
+            )
+
+        if body.recipe_slug or body.dish:
+            await conn.execute(
+                """UPDATE menu_meal SET dish = $1, recipe_id = $2, match_kind = $3
+                    WHERE id = $4""",
+                dish, recipe_id, match_kind, meal_id,
+            )
+
+        if body.recipe_slug or body.dish or body.covers is not None:
+            await conn.execute("UPDATE menu SET meals_changed_at = NOW() WHERE id = $1", menu["id"])
+
+    return {"id": meal_id, "dish": dish, "recipe_id": recipe_id,
+            "match_kind": match_kind, "covers": body.covers}
+
+@app.delete("/api/menus/{slug}")
+async def delete_menu(slug: str):
+    """Supprimer un menu par son slug."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM menu WHERE slug = $1 RETURNING id, slug", slug
+        )
+    if not row:
+        raise HTTPException(404, f"Menu introuvable : {slug}")
+    return {"deleted": row["slug"], "id": row["id"]}
+
+@app.post("/api/ingest")
+async def trigger_ingest():
+    """Re-link menu meals to recipes. Vault ingestion removed (ADR 0022)."""
+    return await relink_meals(DATABASE_DSN)
+
+@app.get("/api/stats")
+async def stats():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM recipe")
+        by_status = await conn.fetch(
+            "SELECT status, COUNT(*) as count FROM recipe GROUP BY status ORDER BY status"
+        )
+        by_family = await conn.fetch(
+            "SELECT family, COUNT(*) as count FROM recipe WHERE family IS NOT NULL GROUP BY family ORDER BY count DESC"
+        )
+    return {
+        "total_recipes": total,
+        "by_status": {r["status"]: r["count"] for r in by_status},
+        "by_family": {r["family"]: r["count"] for r in by_family},
+    }
+
+class ExecutionCreate(BaseModel):
+    date: datetime.date
+    cooked_by: str | None = None
+    rating: int | None = None
+    appreciated_by: list[str] = []
+    appreciation_date: datetime.date | None = None
+    notes: str | None = None
+
+@app.get("/api/recipes/{slug}/executions")
+async def list_executions(slug: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        rows = await conn.fetch(
+            """SELECT id, date, cooked_by, rating, appreciated_by, appreciation_date, notes, created_at
+               FROM recipe_execution WHERE recipe_id = $1 ORDER BY date DESC""",
+            recipe_id,
+        )
+    result = []
+    for r in rows:
+        d = dict(r)
+        _serialize_dates(d, ("date", "appreciation_date", "created_at"))
+        result.append(d)
+    return {"executions": result}
+
+@app.post("/api/recipes/{slug}/executions")
+async def add_execution(slug: str, body: ExecutionCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        row = await conn.fetchrow(
+            """INSERT INTO recipe_execution (recipe_id, date, cooked_by, rating, appreciated_by, appreciation_date, notes)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               RETURNING id, date, cooked_by, rating, appreciated_by, appreciation_date, notes, created_at""",
+            recipe_id, body.date, body.cooked_by, body.rating,
+            body.appreciated_by, body.appreciation_date, body.notes,
+        )
+        await conn.execute(
+            "UPDATE recipe SET execution_count = execution_count + 1 WHERE id = $1",
+            recipe_id,
+        )
+    d = dict(row)
+    _serialize_dates(d, ("date", "appreciation_date", "created_at"))
+    return d
+
+@app.post("/api/seed-history")
+async def seed_history():
+    """Seed execution history from vault frontmatter and known data."""
+    pool = await get_pool(DATABASE_DSN)
+
+    history = [
+        {
+            "slug": "gratin-courge-spaghetti-pois-chiches-feta",
+            "date": datetime.date(2026, 7, 28),
+            "cooked_by": "Julien",
+            "rating": 5,
+            "appreciated_by": ["Julien", "Claire", "Guillaume", "Virginie"],
+            "appreciation_date": datetime.date(2026, 7, 28),
+            "notes": "Unanimité 4/4. Premier plat validé par les beaux-parents. Lieu : Normandie.",
+        },
+        {
+            "slug": "pancakes-banane-avoine",
+            "date": datetime.date(2026, 5, 26),
+            "cooked_by": "Julien",
+            "rating": 5,
+            "appreciated_by": ["Julien", "Claire", "Lou", "Tom"],
+            "appreciation_date": datetime.date(2026, 5, 26),
+            "notes": "Validée famille au premier test. Adoptée par les 4.",
+        },
+        {
+            "slug": "salade-lentilles-froides-graines-courge",
+            "date": datetime.date(2026, 7, 28),
+            "cooked_by": "Julien",
+            "rating": 5,
+            "appreciated_by": ["Guillaume", "Virginie", "Claire", "Julien"],
+            "appreciation_date": datetime.date(2026, 7, 28),
+            "notes": "Invités-validée. Substitutions : ail→gingembre, oignon blanc→rouge (Guillaume).",
+        },
+        {
+            "slug": "ninja-creami-myrtilles-fromage-blanc",
+            "date": datetime.date(2026, 7, 8),
+            "cooked_by": "Julien",
+            "rating": 5,
+            "appreciated_by": ["Julien", "Claire", "Lou", "Tom"],
+            "appreciation_date": datetime.date(2026, 7, 9),
+            "notes": "Pot 1 journal Creami. Parfait après re-spin. Tout le monde adore.",
+        },
+    ]
+
+    seeded = 0
+    async with pool.acquire() as conn:
+        for h in history:
+            row = await conn.fetchrow("SELECT id FROM recipe WHERE slug = $1", h["slug"])
+            if not row:
+                continue
+            recipe_id = row["id"]
+            exists = await conn.fetchval(
+                "SELECT 1 FROM recipe_execution WHERE recipe_id = $1 AND date = $2",
+                recipe_id, h["date"],
+            )
+            if exists:
+                continue
+            await conn.execute(
+                """INSERT INTO recipe_execution (recipe_id, date, cooked_by, rating, appreciated_by, appreciation_date, notes)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                recipe_id, h["date"], h["cooked_by"], h["rating"],
+                h["appreciated_by"], h["appreciation_date"], h["notes"],
+            )
+            await conn.execute(
+                "UPDATE recipe SET execution_count = GREATEST(execution_count, 1) WHERE id = $1",
+                recipe_id,
+            )
+            seeded += 1
+
+    return {"seeded": seeded, "total_entries": len(history)}
+
+@app.post("/api/shopping/import")
+async def import_shopping_session():
+    """Import shopping session from local JSON into PostgreSQL."""
+    data_dir = Path(__file__).parent.parent / "data"
+    files = sorted(data_dir.glob("shopping_choices_*.json"), reverse=True)
+    if not files:
+        raise HTTPException(404, "No shopping JSON found in data/")
+
+    raw = json.loads(files[0].read_text(encoding="utf-8"))
+    meta = raw["meta"]
+    products = raw["products"]
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO shopping_session (date, store, cart_id, covers, people, total, items_count, notes)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING id""",
+            datetime.date.fromisoformat(meta["date"]), meta["store"], meta.get("cart_id"),
+            meta.get("covers"), meta.get("people", []), meta.get("total"),
+            meta.get("items_count"), meta.get("notes"),
+        )
+        session_id = row["id"]
+
+        for p in products:
+            chosen = p.get("product_chosen", {})
+            alts = p.get("alternatives_considered", [])
+            await conn.execute(
+                """INSERT INTO shopping_product
+                   (session_id, item_requested, product_name, brand, product_id,
+                    price_unit, quantity_bought, total_price, status,
+                    rationale, quantity_rationale, alternatives, lesson_learned)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)""",
+                session_id, p["item_requested"],
+                chosen.get("name", ""), chosen.get("brand"),
+                chosen.get("product_id"), chosen.get("price_unit") or chosen.get("price"),
+                chosen.get("quantity_bought", 1),
+                chosen.get("total") or chosen.get("price"),
+                p.get("status", "added"),
+                p.get("rationale", ""),
+                p.get("quantity_rationale"),
+                json.dumps(alts) if alts else "[]",
+                p.get("lesson_learned"),
+            )
+
+        prefs = raw.get("preferences", {})
+        for exc in prefs.get("exclusions", []):
+            await conn.execute(
+                """INSERT INTO shopping_preference (pref_type, key, value, reason)
+                   VALUES ('exclusion', $1, $2, $3)
+                   ON CONFLICT (pref_type, key) DO UPDATE SET value=$2, reason=$3, updated_at=NOW()""",
+                exc["product_type"], exc.get("alternative", ""), exc.get("reason"),
+            )
+        for buy in prefs.get("buy_elsewhere", []):
+            await conn.execute(
+                """INSERT INTO shopping_preference (pref_type, key, value, reason)
+                   VALUES ('buy_elsewhere', $1, $2, $3)
+                   ON CONFLICT (pref_type, key) DO UPDATE SET value=$2, reason=$3, updated_at=NOW()""",
+                buy["product_type"], buy.get("where", ""), buy.get("reason"),
+            )
+
+    return {"imported": session_id, "products": len(products), "file": files[0].name}
+
+class ShoppingItemIn(BaseModel):
+    item_requested: str
+    product_name: str
+    brand: str | None = None
+    product_id: str | None = None
+    price_unit: float | None = None
+    quantity_bought: int = 1
+    total_price: float | None = None
+    status: str = "added"
+    rationale: str = ""
+    quantity_rationale: str | None = None
+    alternatives: list = []
+    lesson_learned: str | None = None
+
+class ShoppingSessionMeta(BaseModel):
+    date: str
+    store: str
+    cart_id: str | None = None
+    covers: int | None = None
+    people: list[str] = []
+    total: float | None = None
+    items_count: int | None = None
+    notes: str | None = None
+
+class PersistCartRequest(BaseModel):
+    meta: ShoppingSessionMeta
+    items: list[ShoppingItemIn]
+
+@app.post("/api/shopping/persist-cart")
+async def persist_cart_with_nutrition(body: PersistCartRequest):
+    """Persist a cart/order into shopping_session + shopping_product."""
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO shopping_session (date, store, cart_id, covers, people, total, items_count, notes)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               RETURNING id""",
+            datetime.date.fromisoformat(body.meta.date), body.meta.store, body.meta.cart_id,
+            body.meta.covers, body.meta.people, body.meta.total,
+            body.meta.items_count, body.meta.notes,
+        )
+        session_id = row["id"]
+
+        for item in body.items:
+            await conn.execute(
+                """INSERT INTO shopping_product
+                   (session_id, item_requested, product_name, brand, product_id,
+                    price_unit, quantity_bought, total_price, status,
+                    rationale, quantity_rationale, alternatives, lesson_learned,
+                    drive_a_id, nutriscore, nutrition, ingredients, allergens,
+                    characteristics, photo_url, product_url, weight, price_per_kg, ean)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                           $14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)""",
+                session_id, item.item_requested, item.product_name, item.brand,
+                item.product_id, item.price_unit, item.quantity_bought,
+                item.total_price, item.status, item.rationale,
+                item.quantity_rationale, json.dumps(item.alternatives),
+                item.lesson_learned,
+                None, None, None, None, None, None, None, None, None, None, None,
+            )
+
+    return {
+        "session_id": session_id,
+        "items_persisted": len(body.items),
+    }
+
+@app.get("/api/shopping/sessions/{session_id}/products")
+async def list_session_products(session_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT product_name, brand, item_requested, price_unit, quantity_bought,
+                      total_price, nutriscore, nutrition, ingredients, allergens,
+                      photo_url, product_url, weight, price_per_kg, ean, status
+                 FROM shopping_product WHERE session_id = $1
+                 ORDER BY id""",
+            session_id,
+        )
+    products = []
+    for r in rows:
+        d = _round_numeric(dict(r))
+        if d.get("nutrition") and isinstance(d["nutrition"], str):
+            d["nutrition"] = json.loads(d["nutrition"])
+        products.append(d)
+    return {"products": products, "total": len(products)}
+
+async def _load_bans():
+    """Les produits et gammes refusés à l'achat, lus en base à chaque appel."""
+    from cooking_manager.bans import load_bans
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT pref_type, key, value, reason, active FROM shopping_preference
+                WHERE active = TRUE AND pref_type IN ('blacklist', 'blacklist_brand')
+                ORDER BY pref_type, key"""
+        )
+    return load_bans(rows)
+
+class CartItem(BaseModel):
+    product: str
+    drive_a_id: str | None = None
+    brand: str | None = None
+
+class CartValidation(BaseModel):
+    menu_slug: str
+    items: list[CartItem]
+
+@app.post("/api/shopping/validate-cart")
+async def validate_cart(body: CartValidation):
+    """Confronte un panier aux bans et au garde-manger — `ok: false` bloque le paiement."""
+    from cooking_manager.bans import find_ban
+    from cooking_manager.cart_freshness import stale_payload
+    from cooking_manager.pantry import confirmation_gate
+
+    bans = await _load_bans()
+    violations = [
+        {"product": item.product, "drive_a_id": item.drive_a_id,
+         "ban": ban.as_dict()}
+        for item in body.items
+        if (ban := find_ban(item.product, bans, drive_a_id=item.drive_a_id,
+                            brand=item.brand)) is not None
+    ]
+    unarbitrated = await _unarbitrated_lines([item.product for item in body.items])
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        confirmation = await _load_pantry_confirmation(conn, body.menu_slug)
+        cart_rows, stale = await _stale_cart_lines(conn, body.menu_slug)
+    gate = confirmation_gate(confirmation, body.menu_slug)
+
+    return {"ok": not violations and not unarbitrated and gate["ok"] and not stale,
+            "checked": len(body.items),
+            "violations": violations, "bans_active": len(bans),
+            "unarbitrated": unarbitrated, "pantry": gate,
+            "stale": stale_payload(cart_rows, stale), "counts": {"stale": len(stale)}}
+
+async def _unarbitrated_lines(products: list[str]) -> list[dict]:
+    """L'arbitrage précède l'entrée : une ligne jamais tranchée bloque le panier (ADR 0032)."""
+    from cooking_manager.ingredients import normalize_name
+
+    wanted = {normalize_name(p): p for p in products if normalize_name(p)}
+    if not wanted:
+        return []
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        settled = {r["ref"] for r in await conn.fetch(
+            """SELECT ref FROM arbitration
+                WHERE subject = 'food_key' AND status = 'settled' AND ref = ANY($1::text[])""",
+            list(wanted))}
+        recurrent = {normalize_name(r["key"]) for r in await conn.fetch(
+            """SELECT key FROM shopping_preference
+                WHERE active = TRUE AND pref_type = 'recurrent'""")}
+    return [{"product": label, "name_normalized": ref,
+             "reason": "jamais confrontée au référentiel aliment"}
+            for ref, label in sorted(wanted.items())
+            if ref not in settled and ref not in recurrent]
+
+CART_ORIGINS = ("menu", "manual", "recurrent", "substitution")
+
+class CartLineIn(BaseModel):
+    menu_slug: str
+    requested: str
+    food: str = ""
+    food_key: str | None = None
+    quantity: int = 1
+    origin: str = "menu"
+    reason: str = ""
+    product_name: str | None = None
+    drive_a_id: str | None = None
+    product_id: str | None = None
+    offer_id: str | None = None
+    seller_id: str | None = None
+    pack_size: float | None = None
+    pack_unit: str | None = None
+    override_reason: str = ""
+    actor: Literal["agent", "ipad"] = "agent"
+
+async def _write_cart_line(conn, body: CartLineIn, *, product_name: str | None,
+                           drive_a_id: str | None, product_id: str | None,
+                           offer_id: str | None, seller_id: str | None,
+                           origin: str, reason: str, status: str) -> dict:
+    row = await conn.fetchrow(
+        """INSERT INTO cart_item
+           (menu_slug, requested, food_key, product_name, drive_a_id, product_id,
+            offer_id, seller_id, quantity, origin, reason, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+           RETURNING id""",
+        body.menu_slug, body.requested, body.food_key, product_name, drive_a_id,
+        product_id, offer_id, seller_id, body.quantity, origin, reason, status,
+    )
+    return {"id": row["id"], "origin": origin, "status": status, "reason": reason,
+            "product": product_name, "drive_a_id": drive_a_id}
+
+async def _menu_ingredients(conn, menu_slug: str) -> list[tuple[str, str]]:
+    """Les (nom normalisé, food_key) des ingrédients des repas du menu."""
+    rows = await conn.fetch(
+        """SELECT DISTINCT ri.name_normalized, ri.food_key
+             FROM menu m
+             JOIN menu_meal mm ON mm.menu_id = m.id
+             JOIN recipe_ingredient ri ON ri.recipe_id = mm.recipe_id
+            WHERE m.slug = $1 AND ri.food_key IS NOT NULL""", menu_slug)
+    return [(r["name_normalized"], r["food_key"]) for r in rows]
+
+async def _menu_food_key(pool, menu_slug: str, requested: str) -> str | None:
+    """L'aliment du menu que désigne un produit nommé — sans lui verify le dit « hors appli »."""
+    from cooking_manager.matching import resolve_food_key
+
+    async with pool.acquire() as conn:
+        pairs = await _menu_ingredients(conn, menu_slug)
+    return resolve_food_key(requested, pairs)
+
+async def _open_cart_rows(conn, menu_slug: str) -> list:
+    """Les lignes du panier du menu, en CartRow."""
+    from cooking_manager.cart_freshness import CartRow
+
+    rows = await conn.fetch(
+        """SELECT id, food_key, origin, status, requested, COALESCE(created_at, NOW()) AS created_at
+             FROM cart_item WHERE menu_slug = $1 ORDER BY id""", menu_slug)
+    return [CartRow(r["id"], r["food_key"], r["origin"], r["status"], r["created_at"],
+                    r["requested"]) for r in rows]
+
+async def _stale_cart_lines(conn, menu_slug: str) -> tuple[list, list]:
+    """Les lignes du panier et celles qu'il faut ré-élire (#186, #187)."""
+    from cooking_manager.cart_freshness import stale_lines
+
+    cart_rows = await _open_cart_rows(conn, menu_slug)
+    changed_at = await conn.fetchval(
+        "SELECT meals_changed_at FROM menu WHERE slug = $1", menu_slug)
+    confirmed_at = await conn.fetchval(
+        "SELECT updated_at FROM pantry_confirmation WHERE menu_slug = $1", menu_slug)
+    food_keys = {key for _, key in await _menu_ingredients(conn, menu_slug)}
+    stale = stale_lines(cart_rows, menu_food_keys=food_keys,
+                        menu_rewritten_at=changed_at, pantry_confirmed_at=confirmed_at)
+    return cart_rows, stale
+
+async def _skip_gone_cart_lines(conn, menu_slug: str) -> None:
+    """Une ligne dont l'aliment a quitté le menu passe en skipped ; sans aliment lié au menu, rien ne bouge."""
+    from cooking_manager.cart_freshness import FOOD_GONE, gone_prefix, stale_lines
+
+    food_keys = {key for _, key in await _menu_ingredients(conn, menu_slug)}
+    if not food_keys:
+        return
+    cart_rows = await _open_cart_rows(conn, menu_slug)
+    keys_by_id = {row.id: row.food_key for row in cart_rows if row.food_key}
+    for s in stale_lines(cart_rows, menu_food_keys=food_keys,
+                         menu_rewritten_at=None, pantry_confirmed_at=None):
+        if s.cause == FOOD_GONE:
+            await conn.execute(
+                "UPDATE cart_item SET status = 'skipped', reason = $2::text || reason WHERE id = $1",
+                s.id, gone_prefix(keys_by_id[s.id]))
+
+async def _supersede_cart_lines(conn, line: dict, body: CartLineIn) -> None:
+    """Une ré-élection du même aliment remplace les lignes ouvertes d'avant."""
+    from cooking_manager.cart_freshness import superseded_by, superseded_prefix
+
+    if line["origin"] not in ("menu", "substitution"):
+        return
+    old = [i for i in superseded_by(await _open_cart_rows(conn, body.menu_slug),
+                                    food_key=body.food_key, origin=line["origin"],
+                                    requested=body.requested)
+           if i != line["id"]]
+    if old:
+        await conn.execute(
+            "UPDATE cart_item SET status = 'skipped', reason = $2::text || reason WHERE id = ANY($1::int[])",
+            old, superseded_prefix(line["id"]))
+
+async def _menu_lines_and_keys(pool, body: CartLineIn) -> tuple[list, dict[str, str]]:
+    """Les lignes de courses du menu et les food_key de leurs noms."""
+    lines = (await menu_shopping_list(body.menu_slug))["lines"]
+    if not lines:
+        return [], {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT name_normalized, food_key FROM recipe_ingredient
+                WHERE name_normalized = ANY($1::text[]) AND food_key IS NOT NULL""",
+            [ln["name_normalized"] for ln in lines])
+    return lines, {r["name_normalized"]: r["food_key"] for r in rows}
+
+async def _skip_covered_cart_lines(conn, body: CartLineIn, reason: str) -> list[int]:
+    """Les lignes ouvertes de cet aliment et de ce nom, que le stock couvre : skipped."""
+    from cooking_manager.cart_freshness import covered_prefix, superseded_by
+
+    old = superseded_by(await _open_cart_rows(conn, body.menu_slug),
+                        food_key=body.food_key, origin="menu", requested=body.requested)
+    if old:
+        await conn.execute(
+            "UPDATE cart_item SET status = 'skipped', reason = $2::text || reason WHERE id = ANY($1::int[])",
+            old, covered_prefix() + reason)
+    return old
+
+@app.post("/api/cart/items")
+async def add_cart_item(body: CartLineIn):
+    """Écrit une ligne du panier. Sans produit nommé, l'application l'élit au drive."""
+    from cooking_manager.election import ASK, ELECTED, Wanted, elect
+    from cooking_manager.verification import covered_by_stock_for, stock_question_for
+
+    if body.origin not in CART_ORIGINS:
+        raise HTTPException(
+            422, f"origin inconnu : {body.origin} (attendu {list(CART_ORIGINS)})")
+    if body.origin in ("menu", "substitution"):
+        await gate_engine.require_gates(body.menu_slug, "elect", body.override_reason, body.actor)
+
+    pool = await get_pool(DATABASE_DSN)
+    if body.food_key is None:
+        body.food_key = await _menu_food_key(pool, body.menu_slug, body.food or body.requested)
+
+    question = None
+    if body.origin == "menu":
+        lines, keys = await _menu_lines_and_keys(pool, body)
+        name = body.food or body.requested
+        question = stock_question_for(lines, food_key=body.food_key, requested=name, keys=keys)
+        if not question and covered_by_stock_for(lines, food_key=body.food_key,
+                                                  requested=body.requested, keys=keys):
+            reason = "le garde-manger couvre le besoin du menu, rien à acheter"
+            async with pool.acquire() as conn:
+                skipped = await _skip_covered_cart_lines(conn, body, reason)
+            return {"verdict": "covered", "skipped": skipped, "reason": reason}
+    if question:
+        async with pool.acquire() as conn:
+            line = await _write_cart_line(
+                conn, body, product_name=None, drive_a_id=None, product_id=None,
+                offer_id=None, seller_id=None, origin="menu", reason=question,
+                status="asked")
+            await _supersede_cart_lines(conn, line, body)
+        return {**line, "verdict": ASK, "question": question, "rejected": []}
+
+    if body.product_id and body.offer_id:
+        if not body.reason.strip():
+            raise HTTPException(422, "une ligne posée à la main s'écrit avec son motif")
+        async with pool.acquire() as conn:
+            line = await _write_cart_line(
+                conn, body, product_name=body.product_name or body.requested,
+                drive_a_id=body.drive_a_id, product_id=body.product_id,
+                offer_id=body.offer_id, seller_id=body.seller_id,
+                origin=body.origin, reason=body.reason, status="elected")
+            await _supersede_cart_lines(conn, line, body)
+        return line
+
+    try:
+        offers = await drive_a.search(body.food or body.requested)
+    except drive_a.DriveUnreachable as exc:
+        raise HTTPException(502, f"drive injoignable : {exc}") from exc
+
+    bans = await _load_bans()
+    verdict = elect(
+        Wanted(label=body.requested, food=body.food, drive_a_id=body.drive_a_id,
+               pack_size=body.pack_size, pack_unit=body.pack_unit),
+        offers, bans)
+
+    if verdict.verdict == ASK:
+        async with pool.acquire() as conn:
+            line = await _write_cart_line(
+                conn, body, product_name=None, drive_a_id=None, product_id=None,
+                offer_id=None, seller_id=None,
+                origin=body.origin if body.origin != "menu" else "menu",
+                reason=verdict.question or verdict.reason, status="asked")
+            await _supersede_cart_lines(conn, line, body)
+        return {**line, "verdict": ASK, "question": verdict.question,
+                "rejected": verdict.rejected}
+
+    offer = verdict.offer
+    assert offer is not None
+    origin = body.origin if verdict.verdict == ELECTED else "substitution"
+    async with pool.acquire() as conn:
+        line = await _write_cart_line(
+            conn, body, product_name=offer.name, drive_a_id=offer.drive_a_id,
+            product_id=offer.product_id, offer_id=offer.offer_id,
+            seller_id=offer.seller_id, origin=origin, reason=verdict.reason,
+            status="elected")
+        await _supersede_cart_lines(conn, line, body)
+    return {**line, "verdict": verdict.verdict, "rejected": verdict.rejected}
+
+class CartPush(BaseModel):
+    menu_slug: str
+    override_reason: str = ""
+    actor: Literal["agent", "ipad"] = "agent"
+
+@app.post("/api/cart/push")
+async def push_cart(body: CartPush):
+    """Rejoue les lignes élues vers le drive, une par une, en relisant chaque ajout."""
+    from cooking_manager.bans import find_ban
+    from cooking_manager.election import Offer
+
+    await gate_engine.require_gates(body.menu_slug, "push", body.override_reason, body.actor)
+    try:
+        status = await drive_a.session_status()
+    except drive_a.DriveUnreachable as exc:
+        raise HTTPException(502, f"drive injoignable : {exc}") from exc
+    if not status.get("authenticated"):
+        raise HTTPException(
+            409, "session Drive A anonyme : le panier n'appartiendrait à personne — "
+                 "re-seed de la session compte avant de pousser")
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        asked = await conn.fetchval(
+            "SELECT COUNT(*) FROM cart_item WHERE menu_slug = $1 AND status = 'asked'",
+            body.menu_slug)
+        rows = await conn.fetch(
+            """SELECT * FROM cart_item
+                WHERE menu_slug = $1 AND status = 'elected'
+                ORDER BY id""",
+            body.menu_slug)
+
+    cart = await drive_a.get_cart()
+    cart_id = cart.get("cartId") or cart.get("cart_id")
+    if cart_id:
+        await drive_a.pin_cart(str(cart_id))
+
+    bans = await _load_bans()
+    pushed, failed = [], []
+    for row in rows:
+        offer = Offer(name=row["product_name"] or row["requested"],
+                      product_id=row["product_id"] or "",
+                      offer_id=row["offer_id"] or "",
+                      drive_a_id=row["drive_a_id"], seller_id=row["seller_id"])
+        ban = find_ban(offer.name, bans, drive_a_id=offer.drive_a_id)
+        outcome = await _push_one(pool, row, offer, ban)
+        (pushed if outcome["status"] == "pushed" else failed).append(outcome)
+
+    return {"menu_slug": body.menu_slug, "asked": asked, "cart_id": cart_id,
+            "pushed": pushed, "failed": failed,
+            "counts": {"asked": asked, "pushed": len(pushed), "failed": len(failed)}}
+
+async def _push_one(pool, row, offer, ban) -> dict:
+    """Un ajout, puis sa relecture — un `ok` du drive ne garantit aucune quantité."""
+    before = 0
+    error = None
+    if ban is not None:
+        error = f"gamme refusée : {ban.label}"
+    else:
+        try:
+            cart = await drive_a.get_cart()
+            before = drive_a.count_for(cart, offer)
+            target = drive_a.push_target(before, row["quantity"])
+            await drive_a.add_to_cart(offer, target)
+            after = drive_a.count_for(await drive_a.get_cart(), offer)
+            error = drive_a.push_error(before, target, after)
+        except drive_a.DriveUnreachable as exc:
+            error = str(exc)
+
+    status = "failed" if error else "pushed"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE cart_item SET status = $1, push_error = $2,
+                      pushed_at = CASE WHEN $1 = 'pushed' THEN NOW() ELSE NULL END
+                WHERE id = $3""",
+            status, error, row["id"])
+    return {"id": row["id"], "product": offer.name, "status": status, "error": error}
+
+class CartLineEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    quantity: int
+    reason: str
+
+def _edit_prefix(old: int, new: int, reason: str) -> str:
+    what = "retirée" if new == 0 else f"quantité {old} → {new}"
+    return f"{what} ({reason.strip()}) · "
+
+async def _edit_cart_line(item_id: int, quantity: int, reason: str) -> dict:
+    """Une ligne déjà poussée change d'abord chez Drive A, relue ; la table ne suit que si le drive a suivi."""
+    from cooking_manager.election import Offer
+
+    if quantity < 0:
+        raise HTTPException(422, "une quantité ne se fixe pas sous 0")
+    if not reason.strip():
+        raise HTTPException(422, "retirer ou changer une ligne s'écrit avec son motif")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM cart_item WHERE id = $1", item_id)
+    if not row:
+        raise HTTPException(404, f"ligne de panier introuvable : {item_id}")
+    if row["status"] == "skipped":
+        raise HTTPException(409, f"ligne {item_id} déjà écartée : {row['reason']}")
+
+    drive = None
+    if row["status"] == "pushed":
+        offer = Offer(name=row["product_name"] or row["requested"],
+                      product_id=row["product_id"] or "", offer_id=row["offer_id"] or "",
+                      drive_a_id=row["drive_a_id"], seller_id=row["seller_id"])
+        try:
+            if not (await drive_a.session_status()).get("authenticated"):
+                raise HTTPException(409, "session Drive A anonyme : ce panier n'est pas celui du compte")
+            in_cart = drive_a.count_for(await drive_a.get_cart(), offer)
+            target = drive_a.edit_target(in_cart, row["quantity"], quantity)
+            await drive_a.set_quantity(offer, target)
+            after = drive_a.count_for(await drive_a.get_cart(), offer)
+        except drive_a.DriveUnreachable as exc:
+            raise HTTPException(502, f"drive injoignable : {exc}") from exc
+        if after != target:
+            raise HTTPException(409, {
+                "error": "le drive n'a pas suivi : la ligne reste telle quelle",
+                "before": in_cart, "wanted": target, "after": after})
+        drive = {"before": in_cart, "after": after}
+
+    prefix = _edit_prefix(row["quantity"], quantity, reason)
+    async with pool.acquire() as conn:
+        if quantity == 0:
+            await conn.execute(
+                "UPDATE cart_item SET status = 'skipped', reason = $2::text || reason WHERE id = $1",
+                item_id, prefix)
+        else:
+            await conn.execute(
+                "UPDATE cart_item SET quantity = $2, reason = $3::text || reason WHERE id = $1",
+                item_id, quantity, prefix)
+    return {"id": item_id, "status": "skipped" if quantity == 0 else row["status"],
+            "quantity": quantity, "previous_quantity": row["quantity"], "drive": drive}
+
+@app.patch("/api/cart/items/{item_id}")
+async def edit_cart_item(item_id: int, body: CartLineEdit):
+    """Fixer la quantité d'une ligne du panier ; 0 la retire (#175)."""
+    return await _edit_cart_line(item_id, body.quantity, body.reason)
+
+@app.delete("/api/cart/items/{item_id}")
+async def remove_cart_item(item_id: int, reason: str = Query(...)):
+    """Retirer une ligne du panier, chez Drive A si elle y est, puis la passer `skipped` (#175)."""
+    return await _edit_cart_line(item_id, 0, reason)
+
+class CartVerify(BaseModel):
+    menu_slug: str
+
+def _to_base(value: float | None, unit: str | None) -> tuple[float, str] | None:
+    """Une quantité dans son unité de base, ou None si l'unité n'est pas connue."""
+    from cooking_manager.pantry import _TO_BASE
+
+    if value is None:
+        return None
+    canonical = _TO_BASE.get((unit or "").strip().lower())
+    if canonical is None:
+        return None
+    base_unit, factor = canonical
+    return float(value) * factor, base_unit
+
+async def _needs_by_food(slug: str) -> tuple[list, int, int]:
+    """La liste arrêtée, indexée par aliment. Un besoin sans `food_key` n'est pas vérifiable,
+    sauf un nom instruit et refusé avec motif (arbitrage `decision: null`) : il ne compte pas comme non lié."""
+    from cooking_manager.verification import Need, lines_stock_unknown, lines_to_buy
+
+    shopping = await menu_shopping_list(slug)
+    to_buy = lines_to_buy(shopping["lines"])
+    unknown = lines_stock_unknown(shopping["lines"])
+    names = [line["name_normalized"] for line in to_buy + unknown]
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT name_normalized, food_key FROM recipe_ingredient
+                WHERE name_normalized = ANY($1::text[]) AND food_key IS NOT NULL""",
+            names)
+    keys = {r["name_normalized"]: r["food_key"] for r in rows}
+    async with pool.acquire() as conn:
+        refused = {r["ref"] for r in await conn.fetch(
+            """SELECT ref FROM arbitration WHERE subject = 'food_key' AND status = 'settled'
+                  AND decision IS NULL AND ref = ANY($1::text[])""", names)}
+        off_drive = {r["key"] for r in await conn.fetch(
+            """SELECT key FROM shopping_preference
+                WHERE active = TRUE AND pref_type = 'off_drive'""")}
+
+    needs, linked, counted = [], 0, 0
+    for line in to_buy + unknown:
+        buy = line["purchase"]
+        food = keys.get(line["name_normalized"])
+        is_unknown = line in unknown
+        counted += 0 if is_unknown or (not food and line["name_normalized"] in refused) else 1
+        if not food or (is_unknown and any(n.food == food for n in needs)):
+            continue
+        linked += 0 if is_unknown else 1
+        want = _to_base(buy["qty"], buy["unit"])
+        plan = line["pack_plan"]
+        pack = _to_base(plan["pack_size"], plan["unit"])
+        needs.append(Need(food=food,
+                          qty=want[0] if want else None,
+                          unit=want[1] if want else buy["unit"],
+                          pack_size=pack[0] if pack and want
+                          and pack[1] == want[1] else None,
+                          stock_unknown=is_unknown,
+                          off_drive=food in off_drive))
+    return needs, linked, counted
+
+def _cart_line_refs(raw: dict) -> set[str]:
+    return {str(raw.get(key)) for key in
+            ("offer_id", "offerId", "product_id", "productId", "drive_a_id")} - {"None", ""}
+
+async def _read_real_cart() -> tuple[dict | None, str]:
+    """Le panier LU chez Drive A, ou le motif qui a empêché de le lire."""
+    try:
+        status = await drive_a.session_status()
+        if not status.get("authenticated"):
+            return None, "session anonyme — le panier lu n'appartiendrait à personne"
+        return await drive_a.get_cart(), ""
+    except drive_a.DriveUnreachable as exc:
+        return None, str(exc)
+
+async def _cart_rows_by_ref(menu_slug: str) -> dict[str, dict]:
+    """Les lignes de l'application, indexées par toutes les références qu'elles portent."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM cart_item WHERE menu_slug = $1", menu_slug)
+    from cooking_manager.verification import index_cart_rows
+
+    return {ref: dict(row) for ref, row in index_cart_rows([dict(r) for r in rows]).items()}
+
+@app.post("/api/cart/verify")
+async def verify_cart(body: CartVerify):
+    """Relit le panier RÉEL chez Drive A et le juge par aliment — `measured` avant `per_food` (#157)."""
+    cart, why = await _read_real_cart()
+    if cart is None:
+        from cooking_manager.verification import unreadable
+
+        payload = unreadable(why)
+    else:
+        payload = await _reconcile(body.menu_slug, cart)
+    await gate_engine.record_verify(body.menu_slug, payload)
+    return payload
+
+async def _reconcile(menu_slug: str, cart: dict) -> dict:
+    """Le panier lu confronté à la liste arrêtée — il MONTRE, il ne corrige rien (#113)."""
+    from cooking_manager.matching import food_link_counts
+    from cooking_manager.packaging import candidate_sizes, estimated_grams, grams_for_pieces
+    from cooking_manager.verification import CartLine, verify
+
+    from cooking_manager.bans import is_recurrent
+
+    needs, linked, total = await _needs_by_food(menu_slug)
+    want_unit = {need.food: need.unit for need in needs}
+    by_ref = await _cart_rows_by_ref(menu_slug)
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        habits = [dict(r) for r in await conn.fetch(
+            """SELECT pref_type, key, value, active FROM shopping_preference
+                WHERE active = TRUE AND pref_type = 'recurrent'""")]
+    lines = []
+    for raw in drive_a.cart_lines(cart):
+        row = next((by_ref[ref] for ref in _cart_line_refs(raw) if ref in by_ref), None)
+        label = str(raw.get("name") or raw.get("label") or "")
+        count = int(raw.get("quantity") or raw.get("qty") or 0)
+        sizes = [base for value, unit in
+                 candidate_sizes(label, (row or {}).get("product_name") or "")
+                 if (base := _to_base(value, unit) or (value, unit))]
+        size = next((b for b in sizes if b[1] == want_unit.get((row or {}).get("food_key"))),
+                    sizes[0] if sizes else None)
+        estimate = None if size else estimated_grams(
+            (row or {}).get("product_name") or label, (row or {}).get("food_key"))
+        if size and size[1] == "pièce" and want_unit.get((row or {}).get("food_key")) == "g":
+            estimate = grams_for_pieces((row or {}).get("food_key"), size[0])
+        if estimate:
+            size = (estimate, "g")
+        lines.append(CartLine(
+            label=(label or (row or {}).get("product_name") or "?")
+            + (" (poids estimé)" if estimate else ""),
+            food=(row or {}).get("food_key"),
+            qty=size[0] * count if size else None,
+            unit=size[1] if size else None,
+            origin="recurrent" if is_recurrent(label, habits)
+            else str((row or {}).get("origin") or "")))
+
+    result = verify(needs, lines, datetime.datetime.now().isoformat(timespec="minutes"))
+    result["menu_slug"] = menu_slug
+    result["food_link"] = food_link_counts(linked, total)
+    if result["food_link"]["unlinked"]:
+        result["ok"] = False
+        result["reason"] = (
+            f"{result['food_link']['unlinked']} besoin(s) sans aliment rattaché : "
+            "ils ne peuvent pas être confrontés au panier"
+            + (f" ; {result['reason']}" if result["reason"] else ""))
+    return result
+
+STORE_DRIVE = "drive_a-drive"
+
+class CartOrder(BaseModel):
+    menu_slug: str
+    override_reason: str = ""
+    actor: Literal["agent", "ipad"] = "agent"
+
+def _cart_total(cart: dict) -> float | None:
+    for key in ("total", "totalPrice", "amount"):
+        value = cart.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    prices = cart.get("prices")
+    if isinstance(prices, dict):
+        for key in ("total", "totalIncludingTaxes"):
+            value = prices.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+async def _persist_real_cart(menu_slug: str, cart: dict,
+                             by_ref: dict[str, dict]) -> dict:
+    """Écrit lignes et quantités LUES chez le drive. Son échec bloque la commande (ADR 0028)."""
+    lines = drive_a.cart_lines(cart)
+    if not lines:
+        raise HTTPException(
+            409, "le panier lu chez Drive A est vide : rien à tracer, donc rien à commander")
+    cart_id = str(cart.get("cartId") or cart.get("cart_id") or "") or None
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            session_id = await conn.fetchval(
+                """INSERT INTO shopping_session
+                   (date, store, cart_id, total, items_count, notes)
+                   VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
+                datetime.date.today(), STORE_DRIVE, cart_id, _cart_total(cart),
+                len(lines), f"menu {menu_slug} — panier relu avant commande (#113)")
+            for raw in lines:
+                row = next((by_ref[ref] for ref in _cart_line_refs(raw)
+                            if ref in by_ref), None)
+                label = str(raw.get("name") or raw.get("label") or "?")
+                await conn.execute(
+                    """INSERT INTO shopping_product
+                       (session_id, item_requested, product_name, product_id,
+                        price_unit, total_price, brand,
+                        quantity_bought, status, rationale, drive_a_id)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                    session_id, (row or {}).get("requested") or label, label,
+                    raw.get("product_id") or (row or {}).get("product_id"),
+                    raw.get("unit_price"), raw.get("total_price"),
+                    raw.get("brand") or None,
+                    int(raw.get("quantity") or raw.get("qty") or 0),
+                    "added" if row else "off_app",
+                    (row or {}).get("reason") or "",
+                    (row or {}).get("drive_a_id"))
+    return {"session_id": session_id, "items_persisted": len(lines)}
+
+@app.post("/api/cart/order")
+async def order_cart(body: CartOrder):
+    """Persist, puis réconciliation, puis commande — jamais l'inverse, jamais l'un sans l'autre (#113)."""
+    cart, why = await _read_real_cart()
+    if cart is None:
+        raise HTTPException(409, f"panier Drive A illisible : {why} — aucune commande")
+
+    by_ref = await _cart_rows_by_ref(body.menu_slug)
+    persisted = await _persist_real_cart(body.menu_slug, cart, by_ref)
+    reconciliation = await _reconcile(body.menu_slug, cart)
+    await gate_engine.record_verify(body.menu_slug, reconciliation, body.actor)
+    await gate_engine.require_gates(body.menu_slug, "order", body.override_reason, body.actor)
+
+    if not reconciliation["ok"] and not body.override_reason.strip():
+        raise HTTPException(409, {
+            "reason": "la réconciliation bloque la commande : "
+                      + (reconciliation["reason"] or "écart non expliqué"),
+            "persisted": persisted, "reconciliation": reconciliation,
+            "note": "un accord humain s'écrit dans override_reason — "
+                    "la réconciliation montre, elle ne corrige pas"})
+
+    try:
+        order = await drive_a.create_order()
+    except drive_a.DriveUnreachable as exc:
+        raise HTTPException(502, f"commande refusée par le drive : {exc}") from exc
+
+    if body.override_reason.strip():
+        pool = await get_pool(DATABASE_DSN)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE shopping_session SET notes = notes || $2 WHERE id = $1",
+                persisted["session_id"],
+                f" — écart assumé : {body.override_reason.strip()}")
+
+    return {"menu_slug": body.menu_slug, "persisted": persisted,
+            "reconciliation": reconciliation, "order": order,
+            "override_reason": body.override_reason.strip() or None}
+
+@app.get("/api/cart")
+async def read_cart(menu_slug: str = Query(...)):
+    """Le panier de l'application — `asked` se lit AVANT `lines` (#156)."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM cart_item WHERE menu_slug = $1 ORDER BY id", menu_slug)
+        _, stale = await _stale_cart_lines(conn, menu_slug)
+    stale_by_id = {s.id: {"cause": s.cause, "reason": s.reason} for s in stale}
+    lines = []
+    for r in rows:
+        d = _round_numeric(dict(r))
+        _serialize_dates(d, ("created_at", "pushed_at"))
+        d["stale"] = stale_by_id.get(r["id"])
+        lines.append(d)
+    counts = {status: sum(1 for line in lines if line["status"] == status)
+              for status in ("asked", "elected", "pushed", "failed", "skipped")}
+    counts["stale"] = len(stale)
+    return {"menu_slug": menu_slug, "counts": counts, "lines": lines}
+
+@app.get("/api/shopping/preferences")
+async def list_shopping_preferences():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM shopping_preference WHERE active = TRUE ORDER BY pref_type, key"
+        )
+    return {"preferences": [dict(r) for r in rows]}
+
+@app.get("/api/shopping/sessions")
+async def list_shopping_sessions():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM shopping_session ORDER BY date DESC LIMIT 20"
+        )
+    sessions = []
+    for r in rows:
+        d = _round_numeric(dict(r))
+        _serialize_dates(d, ("date", "created_at"))
+        sessions.append(d)
+    return {"sessions": sessions}
+
+class BlacklistBody(BaseModel):
+    product: str
+    reason: str | None = None
+    pref_type: str = "blacklist"
+    value: str | None = None
+
+@app.post("/api/shopping/preferences")
+async def add_shopping_preference(body: BlacklistBody):
+    from cooking_manager.bans import PREF_TYPES
+
+    if body.pref_type not in PREF_TYPES:
+        raise HTTPException(
+            400, f"pref_type inconnu : {body.pref_type} (attendu {sorted(PREF_TYPES)})")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO shopping_preference (pref_type, key, value, reason)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (pref_type, key) DO UPDATE
+               SET value = EXCLUDED.value, reason = EXCLUDED.reason,
+                   active = TRUE, updated_at = NOW()""",
+            body.pref_type, body.product, body.value or body.reason or "vocal",
+            body.reason,
+        )
+    return {"ok": True, "product": body.product, "pref_type": body.pref_type}
+
+class RecipeNoteBody(BaseModel):
+    note: str
+
+@app.post("/api/recipes/{slug}/note")
+async def add_recipe_note(slug: str, body: RecipeNoteBody):
+    today = datetime.date.today()
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        row = await conn.fetchrow(
+            """INSERT INTO recipe_execution (recipe_id, date, notes)
+               VALUES ($1, $2, $3)
+               RETURNING id""",
+            recipe_id, today, body.note,
+        )
+    return {"ok": True, "execution_id": row["id"]}
+
+class StepEditBody(BaseModel):
+    text: str
+
+@app.patch("/api/recipes/{slug}/steps/{position}")
+async def edit_recipe_step(slug: str, position: int, body: StepEditBody):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        result = await conn.execute(
+            "UPDATE recipe_step SET text = $1 WHERE recipe_id = $2 AND position = $3",
+            body.text, recipe_id, position,
+        )
+        if result == "UPDATE 0":
+            raise HTTPException(404, f"Step {position} not found")
+    return {"ok": True, "position": position}
+
+class FeedbackBody(BaseModel):
+    dish: str
+    convive: str | None = None
+    liked: bool = True
+    comment: str | None = None
+
+@app.post("/api/feedback")
+async def add_meal_feedback(body: FeedbackBody):
+    today = datetime.date.today()
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM recipe WHERE LOWER(title) LIKE '%' || LOWER($1) || '%' LIMIT 1",
+            body.dish,
+        )
+        if not row:
+            return {"ok": False, "reason": f"Aucune recette trouvée pour « {body.dish} »"}
+        recipe_id = row["id"]
+        appreciated_by = [body.convive] if body.convive and body.liked else []
+        notes = body.comment
+        if not body.liked and body.convive:
+            notes = (notes or "") + f" ({body.convive} n'a pas aimé)"
+        await conn.fetchrow(
+            """INSERT INTO recipe_execution (recipe_id, date, appreciated_by, appreciation_date, notes)
+               VALUES ($1, $2, $3, $4, $5)
+               RETURNING id""",
+            recipe_id, today, appreciated_by, today if appreciated_by else None, notes,
+        )
+    return {"ok": True, "dish": body.dish}
+
+class InterpretBody(BaseModel):
+    verbatim: str
+
+@app.post("/api/feedback/interpret")
+async def interpret_feedback(body: InterpretBody):
+    reading = interpret(body.verbatim)
+    return {
+        "appreciation": reading.appreciation,
+        "verdict": reading.verdict,
+        "issue_kinds": list(reading.issue_kinds),
+        "ambiguous": {facet: list(keys) for facet, keys in reading.ambiguous.items()},
+        "unmatched": list(reading.unmatched),
+        "vocabulary_version": VOCABULARY_VERSION,
+    }
+
+class RecipeFeedbackBody(BaseModel):
+    person: str
+    served_on: datetime.date
+    appreciation: str | None = None
+    verbatim: str | None = None
+    menu_meal_id: int | None = None
+    source: str = "review"
+
+def _resolve_axis(facet: str, explicit: str | None, verbatim: str | None, reading_value: str | None,
+                  ambiguous: dict[str, tuple[str, ...]]) -> str:
+    """L'axe explicite prime ; sinon le verbatim doit avoir tranché de lui-même."""
+    if explicit is not None:
+        try:
+            return validate_concept(facet, explicit)
+        except UnknownConcept as exc:
+            raise HTTPException(422, str(exc)) from exc
+    if reading_value is not None:
+        return reading_value
+    if facet in ambiguous:
+        raise HTTPException(422, {
+            "reason": f"{facet} ambigu dans le verbatim",
+            "candidates": list(ambiguous[facet]),
+        })
+    raise HTTPException(422, {
+        "reason": f"{facet} absent — ni clé explicite, ni synonyme reconnu",
+        "verbatim": verbatim,
+    })
+
+@app.post("/api/recipes/{slug}/feedback")
+async def add_recipe_feedback(slug: str, body: RecipeFeedbackBody):
+    reading = interpret(body.verbatim) if body.verbatim else Reading()
+    appreciation = _resolve_axis(
+        APPRECIATION_FACET, body.appreciation, body.verbatim,
+        reading.appreciation, reading.ambiguous,
+    )
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        person = await conn.fetchrow(
+            "SELECT id FROM person WHERE LOWER(name) = LOWER($1)", body.person,
+        )
+        if not person:
+            raise HTTPException(404, f"Personne inconnue : {body.person}")
+        row = await conn.fetchrow(
+            """INSERT INTO recipe_feedback
+                   (recipe_id, menu_meal_id, person_id, served_on,
+                    appreciation, verbatim, source)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (person_id, served_on, recipe_id) DO UPDATE
+               SET appreciation = EXCLUDED.appreciation,
+                   verbatim     = EXCLUDED.verbatim,
+                   menu_meal_id = COALESCE(EXCLUDED.menu_meal_id, recipe_feedback.menu_meal_id),
+                   source       = EXCLUDED.source
+               RETURNING id""",
+            recipe_id, body.menu_meal_id, person["id"], body.served_on,
+            appreciation, body.verbatim, body.source,
+        )
+    return {"ok": True, "feedback_id": row["id"], "appreciation": appreciation}
+
+class RecipeVerdictBody(BaseModel):
+    served_on: datetime.date
+    verdict: str | None = None
+    issue_kinds: list[str] | None = None
+    verbatim: str | None = None
+
+@app.post("/api/recipes/{slug}/verdict")
+async def add_recipe_verdict(slug: str, body: RecipeVerdictBody):
+    reading = interpret(body.verbatim) if body.verbatim else Reading()
+    verdict = _resolve_axis(
+        VERDICT_FACET, body.verdict, body.verbatim,
+        reading.verdict, reading.ambiguous,
+    )
+    issues = body.issue_kinds if body.issue_kinds is not None else list(reading.issue_kinds)
+    for key in issues:
+        try:
+            validate_concept(ISSUE_FACET, key)
+        except UnknownConcept as exc:
+            raise HTTPException(422, str(exc)) from exc
+    if verdict == "adjust" and not issues:
+        raise HTTPException(422, {
+            "reason": "verdict 'adjust' sans issue_kinds — la correction serait perdue",
+            "verbatim": body.verbatim,
+        })
+    if verdict == "situational" and not body.verbatim:
+        raise HTTPException(422, {
+            "reason": "verdict 'situational' sans verbatim — l'occasion serait perdue",
+        })
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        row = await conn.fetchrow(
+            """INSERT INTO recipe_verdict (recipe_id, served_on, verdict, issue_kinds, verbatim)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (recipe_id, served_on) DO UPDATE
+               SET verdict     = EXCLUDED.verdict,
+                   issue_kinds = EXCLUDED.issue_kinds,
+                   verbatim    = EXCLUDED.verbatim
+               RETURNING id""",
+            recipe_id, body.served_on, verdict, issues, body.verbatim,
+        )
+    return {"ok": True, "verdict_id": row["id"], "verdict": verdict, "issue_kinds": issues}
+
+@app.get("/api/recipes/{slug}/feedback")
+async def list_recipe_feedback(slug: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        feedback = await conn.fetch(
+            """SELECT f.served_on, p.name AS person, f.appreciation, f.verbatim, f.source
+               FROM recipe_feedback f JOIN person p ON p.id = f.person_id
+               WHERE f.recipe_id = $1
+               ORDER BY f.served_on DESC, p.name""",
+            recipe_id,
+        )
+        verdicts = await conn.fetch(
+            """SELECT served_on, verdict, issue_kinds, verbatim
+               FROM recipe_verdict WHERE recipe_id = $1 ORDER BY served_on DESC""",
+            recipe_id,
+        )
+    rows = [dict(r) for r in feedback]
+    verdict_rows = [dict(r) for r in verdicts]
+    for row in rows + verdict_rows:
+        _serialize_dates(row, ("served_on",))
+    return {"slug": slug, "feedback": rows, "verdicts": verdict_rows}
+
+@app.get("/api/vocabulary/feedback")
+async def get_feedback_vocabulary():
+    """Les trois axes de retour, libellés compris — le front ne les redéclare pas."""
+    vocabulary = load_vocabulary()
+    return {
+        "version": VOCABULARY_VERSION,
+        "facets": {
+            facet: [
+                {"key": c["key"], "label": c["label"], "definition": c["definition"]}
+                for c in vocabulary[facet]
+            ]
+            for facet in (APPRECIATION_FACET, VERDICT_FACET, ISSUE_FACET)
+        },
+    }
+
+
+class ProductRemarkBody(BaseModel):
+    shopping_product_id: int | None = None
+    product_ref: str | None = None
+    quality: str
+    channel: str | None = None
+    aspect: str = "general"
+    verbatim: str | None = None
+    served_on: datetime.date | None = None
+    person: str | None = None
+
+@app.post("/api/product-remarks")
+async def add_product_remark(body: ProductRemarkBody):
+    vocab = load_vocabulary()
+    valid_q = {c["key"] for c in vocab.get("product_qualities", [])}
+    if body.quality not in valid_q:
+        raise HTTPException(422, f"quality inconnue : {body.quality}, attendu {sorted(valid_q)}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        person_id = None
+        if body.person:
+            p = await conn.fetchrow("SELECT id FROM person WHERE LOWER(name) = LOWER($1)", body.person)
+            if p:
+                person_id = p["id"]
+        if body.shopping_product_id is None and body.product_ref is None and body.verbatim:
+            sp = await conn.fetchrow(
+                """SELECT id FROM shopping_product
+                   WHERE LOWER(product_name) LIKE '%' || LOWER($1) || '%'
+                   ORDER BY created_at DESC LIMIT 1""",
+                body.verbatim.split()[0] if body.verbatim else "",
+            )
+            if sp:
+                body.shopping_product_id = sp["id"]
+        row = await conn.fetchrow(
+            """INSERT INTO product_remark
+                   (shopping_product_id, product_ref, quality, channel, aspect,
+                    verbatim, served_on, person_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING id""",
+            body.shopping_product_id, body.product_ref, body.quality,
+            body.channel, body.aspect, body.verbatim, body.served_on, person_id,
+        )
+    return {"ok": True, "id": row["id"]}
+
+@app.get("/api/product-remarks")
+async def list_product_remarks(shopping_product_id: int | None = None, limit: int = 50):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        if shopping_product_id:
+            rows = await conn.fetch(
+                """SELECT r.*, p.name AS person_name
+                   FROM product_remark r LEFT JOIN person p ON p.id = r.person_id
+                   WHERE r.shopping_product_id = $1
+                   ORDER BY r.created_at DESC LIMIT $2""",
+                shopping_product_id, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT r.*, p.name AS person_name
+                   FROM product_remark r LEFT JOIN person p ON p.id = r.person_id
+                   ORDER BY r.created_at DESC LIMIT $1""",
+                limit,
+            )
+    out = [dict(r) for r in rows]
+    for o in out:
+        _serialize_dates(o, ("served_on", "created_at"))
+    return {"remarks": out}
+
+
+class CookingTipBody(BaseModel):
+    kind: str
+    step_number: int | None = None
+    verbatim: str
+
+@app.post("/api/recipes/{slug}/tips")
+async def add_cooking_tip(slug: str, body: CookingTipBody):
+    vocab = load_vocabulary()
+    valid_k = {c["key"] for c in vocab.get("cooking_tip_kinds", [])}
+    if body.kind not in valid_k:
+        raise HTTPException(422, f"kind inconnu : {body.kind}, attendu {sorted(valid_k)}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        row = await conn.fetchrow(
+            """INSERT INTO cooking_tip (recipe_id, kind, step_number, verbatim)
+               VALUES ($1, $2, $3, $4) RETURNING id""",
+            recipe_id, body.kind, body.step_number, body.verbatim,
+        )
+    return {"ok": True, "id": row["id"]}
+
+@app.get("/api/recipes/{slug}/tips")
+async def list_cooking_tips(slug: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        rows = await conn.fetch(
+            "SELECT * FROM cooking_tip WHERE recipe_id = $1 ORDER BY created_at DESC",
+            recipe_id,
+        )
+    out = [dict(r) for r in rows]
+    for o in out:
+        _serialize_dates(o, ("created_at",))
+    return {"tips": out}
+
+
+class SubstitutionDiscoveryBody(BaseModel):
+    original_ingredient: str
+    substitute_ingredient: str
+    outcome: str
+    who_preferred: str | None = None
+    verbatim: str | None = None
+    served_on: datetime.date | None = None
+
+@app.post("/api/recipes/{slug}/substitutions")
+async def add_substitution_discovery(slug: str, body: SubstitutionDiscoveryBody):
+    vocab = load_vocabulary()
+    valid_o = {c["key"] for c in vocab.get("substitution_outcomes", [])}
+    if body.outcome not in valid_o:
+        raise HTTPException(422, f"outcome inconnu : {body.outcome}, attendu {sorted(valid_o)}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        row = await conn.fetchrow(
+            """INSERT INTO substitution_discovery
+                   (recipe_id, original_ingredient, substitute_ingredient,
+                    outcome, who_preferred, verbatim, served_on)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (recipe_id, original_ingredient, substitute_ingredient)
+               DO UPDATE SET outcome = EXCLUDED.outcome,
+                            who_preferred = EXCLUDED.who_preferred,
+                            verbatim = EXCLUDED.verbatim,
+                            served_on = EXCLUDED.served_on
+               RETURNING id""",
+            recipe_id, body.original_ingredient, body.substitute_ingredient,
+            body.outcome, body.who_preferred, body.verbatim, body.served_on,
+        )
+    return {"ok": True, "id": row["id"]}
+
+@app.get("/api/recipes/{slug}/substitutions")
+async def list_substitution_discoveries(slug: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        rows = await conn.fetch(
+            "SELECT * FROM substitution_discovery WHERE recipe_id = $1 ORDER BY created_at DESC",
+            recipe_id,
+        )
+    out = [dict(r) for r in rows]
+    for o in out:
+        _serialize_dates(o, ("served_on", "created_at"))
+    return {"substitutions": out}
+
+
+class ServiceContextBody(BaseModel):
+    context: str
+    verbatim: str | None = None
+
+@app.post("/api/recipes/{slug}/service-contexts")
+async def add_service_context(slug: str, body: ServiceContextBody):
+    vocab = load_vocabulary()
+    valid_c = {c["key"] for c in vocab.get("service_contexts", [])}
+    if body.context not in valid_c:
+        raise HTTPException(422, f"context inconnu : {body.context}, attendu {sorted(valid_c)}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        row = await conn.fetchrow(
+            """INSERT INTO service_context (recipe_id, context, verbatim)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (recipe_id, context) DO UPDATE
+               SET verbatim = EXCLUDED.verbatim
+               RETURNING id""",
+            recipe_id, body.context, body.verbatim,
+        )
+    return {"ok": True, "id": row["id"]}
+
+@app.get("/api/recipes/{slug}/service-contexts")
+async def list_service_contexts(slug: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        recipe_id = await _get_recipe_id(conn, slug)
+        rows = await conn.fetch(
+            "SELECT * FROM service_context WHERE recipe_id = $1 ORDER BY created_at DESC",
+            recipe_id,
+        )
+    out = [dict(r) for r in rows]
+    for o in out:
+        _serialize_dates(o, ("created_at",))
+    return {"contexts": out}
+
+
+class LeftoverBody(BaseModel):
+    ingredient: str
+    quantity: str | None = None
+    shelf_life_days: int | None = None
+
+@app.post("/api/pantry/leftover")
+async def add_pantry_leftover(body: LeftoverBody):
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.pantry import STATUS_OK, entry_quantity
+
+    normalized = normalize_name(body.ingredient)
+    qty_value, unit, refusal = entry_quantity(body.quantity, STATUS_OK)
+    if refusal:
+        raise HTTPException(422, {"error": refusal, "ingredient": body.ingredient,
+                                  "quantity": body.quantity})
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO pantry_item
+                   (name, name_normalized, section, qty_text, qty_value, unit, status, source)
+               VALUES ($1, $2, 'Restes', $3, $4, $5, 'ok', 'voice')
+               ON CONFLICT (name_normalized, section) DO UPDATE
+               SET qty_text = EXCLUDED.qty_text, qty_value = EXCLUDED.qty_value,
+                   unit = EXCLUDED.unit, status = 'ok', updated_at = NOW()""",
+            body.ingredient, normalized, body.quantity or "", qty_value, unit,
+        )
+    return {"ok": True, "ingredient": body.ingredient,
+            "qty_value": qty_value, "unit": unit}
+
+@app.get("/api/drives/{store}/stores")
+async def drive_stores(store: str, postal_code: str = Query(..., min_length=4)):
+    """Find nearby stores for a given enseigne + postal code."""
+    from dataclasses import asdict
+
+    if store == "drive_b":
+        try:
+            from drive_b_drive.stores import find_stores as drive_b_find  # type: ignore[import-untyped]
+        except ImportError:
+            raise HTTPException(501, "drive_b_drive not installed") from None
+        stores = await drive_b_find(postal_code)
+        return {"stores": [asdict(s) for s in stores]}
+
+    raise HTTPException(400, "Enseigne inconnue, choix : drive_b")
+
+@app.get("/api/drives/{store}/search")
+async def drive_search(store: str, q: str = Query(..., min_length=1)):
+    from .drives import search_store, SUPPORTED_STORES
+    from dataclasses import asdict
+    if store not in SUPPORTED_STORES:
+        raise HTTPException(400, f"Enseigne inconnue, choix : {', '.join(SUPPORTED_STORES)}")
+    results = await search_store(store, q)
+    return {"products": [asdict(p) for p in results]}
+
+class MapIngredientsBody(BaseModel):
+    store: str
+    ingredients: list[dict]
+
+@app.post("/api/drives/map-ingredients")
+async def drive_map_ingredients(body: MapIngredientsBody):
+    from .drives import map_ingredients, SUPPORTED_STORES
+    if body.store not in SUPPORTED_STORES:
+        raise HTTPException(400, f"Enseigne inconnue, choix : {', '.join(SUPPORTED_STORES)}")
+    mappings = await map_ingredients(body.store, body.ingredients)
+    return {"mappings": mappings, "store": body.store}
+
+class CompareBody(BaseModel):
+    ingredients: list[dict]
+
+@app.post("/api/drives/compare")
+async def drive_compare(body: CompareBody):
+    """Map ingredients on available stores and return results."""
+    from .drives import map_ingredients
+
+    drive_b_mappings = await map_ingredients("drive_b", body.ingredients)
+
+    def _total(mappings: list[dict]) -> float:
+        s = 0.0
+        for m in mappings:
+            sel = m.get("selected", -1)
+            results = m.get("results", [])
+            if 0 <= sel < len(results):
+                p = results[sel].get("price")
+                if p is not None:
+                    s += p
+        return round(s, 2)
+
+    return {
+        "drive_b": {"mappings": drive_b_mappings, "total": _total(drive_b_mappings)},
+    }
+
+@app.post("/api/audio")
+async def voice_audio(file: UploadFile):
+    """Audio → transcription → intent JSON. Pipeline complet."""
+    from .stt import process_audio
+
+    audio_bytes = await file.read()
+    content_type = file.content_type or "audio/webm"
+    try:
+        result = await process_audio(audio_bytes, content_type)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e)) from None
+    return result
+
+class IntentRequest(BaseModel):
+    text: str
+
+@app.post("/api/intent")
+async def voice_intent(body: IntentRequest):
+    """Texte → intent JSON (sans passer par l'audio)."""
+    from .stt import interpret
+
+    try:
+        intent = await interpret(body.text)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e)) from None
+    return {"transcript": body.text, "intent": intent}
+
+@app.get("/health")
+async def health():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        version = await conn.fetchval("SELECT version()")
+    return {"status": "ok", "db": version, "app_version": "2.0.0"}
+
+def _recipe_to_dict(row) -> dict:
+    d = _round_numeric(dict(row))
+    macros = {}
+    for k in ("macros_kcal", "macros_protein", "macros_carbs", "macros_fat"):
+        val = d.pop(k, None)
+        if val is not None:
+            macros[k.replace("macros_", "")] = val
+    if macros:
+        d["macros"] = macros
+    _serialize_dates(d, ("created", "updated"))
+    return d
+
+class PersonCreate(BaseModel):
+    name: str
+    full_name: str | None = None
+    circle: str = "occasional"
+    role: str = "adult"
+    diet: str = "omnivore"
+    dislikes: list[str] = []
+    forbidden: list[str] = []
+    diet_exceptions: list[str] = []
+    notes: str | None = None
+    default_attendance: str = "never"
+
+class PersonUpdate(BaseModel):
+    full_name: str | None = None
+    circle: str | None = None
+    role: str | None = None
+    diet: str | None = None
+    dislikes: list[str] | None = None
+    forbidden: list[str] | None = None
+    diet_exceptions: list[str] | None = None
+    notes: str | None = None
+    default_attendance: str | None = None
+    is_active: bool | None = None
+    birth_date: datetime.date | None = None
+    height_cm: float | None = None
+    weight_kg: float | None = None
+    activity_level: str | None = None
+    nutrition_notes: str | None = None
+
+class RelationshipCreate(BaseModel):
+    person_id: int
+    related_id: int
+    type: str
+
+class CustodyScheduleCreate(BaseModel):
+    person_id: int
+    pattern: str = "alternating_weeks"
+    reference_date: str
+    reference_present: bool = True
+    notes: str | None = None
+
+class CanteenScheduleCreate(BaseModel):
+    person_id: int
+    weekday: int
+    slot: str = "lunch"
+    active_outside_holidays: bool = True
+
+class SchoolPeriodCreate(BaseModel):
+    label: str
+    start_date: datetime.date
+    end_date: datetime.date
+
+class AbsenceCreate(BaseModel):
+    person_id: int
+    start_date: datetime.date
+    end_date: datetime.date
+    slot: str | None = None
+    reason: str | None = None
+
+class StayCreate(BaseModel):
+    label: str
+    start_date: datetime.date
+    end_date: datetime.date
+    location: str | None = None
+    cooking: bool = True
+    member_ids: list[int] = []
+
+@app.get("/api/persons")
+async def list_persons(circle: str | None = None, active_only: bool = True):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        where, params = ["1=1"], []
+        if circle:
+            params.append(circle)
+            where.append(f"circle = ${len(params)}")
+        if active_only:
+            where.append("is_active")
+        rows = await conn.fetch(
+            f"SELECT * FROM person WHERE {' AND '.join(where)} ORDER BY circle, name",
+            *params,
+        )
+    return [_round_numeric(dict(r)) for r in rows]
+
+@app.post("/api/persons", status_code=201)
+async def create_person(body: PersonCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO person (name, full_name, circle, role, diet, dislikes,
+                                   forbidden, diet_exceptions, notes, default_attendance)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
+            body.name, body.full_name, body.circle, body.role, body.diet,
+            body.dislikes, body.forbidden, body.diet_exceptions, body.notes,
+            body.default_attendance,
+        )
+    return dict(row)
+
+@app.get("/api/persons/{person_id}")
+async def get_person(person_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM person WHERE id = $1", person_id)
+    if not row:
+        raise HTTPException(404, "Person not found")
+    return dict(row)
+
+@app.patch("/api/persons/{person_id}")
+async def update_person(person_id: int, body: PersonUpdate):
+    sets, params = [], [person_id]
+    for fld, val in body.model_dump(exclude_unset=True).items():
+        params.append(val)
+        sets.append(f"{fld} = ${len(params)}")
+    if not sets:
+        raise HTTPException(400, "Nothing to update")
+    sets.append("updated_at = NOW()")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE person SET {', '.join(sets)} WHERE id = $1 RETURNING *", *params,
+        )
+    if not row:
+        raise HTTPException(404, "Person not found")
+    return dict(row)
+
+PREFERENCE_KINDS = ("minimize", "maximize", "cap", "rotate", "no_restriction")
+
+class PreferenceCreate(BaseModel):
+    person: str | None = None
+    kind: str
+    target: str
+    value: float | None = None
+    unit: str | None = None
+    scope: str | None = None
+    reason: str | None = None
+
+@app.get("/api/preferences")
+async def list_preferences(person: str | None = None):
+    """Préférences alimentaires : ni interdits, ni aversions — ce qui pèse sans bloquer."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT d.id, p.name AS person, d.kind, d.target, d.value, d.unit,
+                      d.scope, d.reason, d.since, d.until
+                 FROM dietary_preference d
+                 LEFT JOIN person p ON p.id = d.person_id
+                WHERE (d.until IS NULL OR d.until >= CURRENT_DATE)
+                  AND ($1::text IS NULL OR p.name IS NULL OR LOWER(p.name) = LOWER($1))
+             ORDER BY p.name NULLS FIRST, d.kind, d.target""",
+            person,
+        )
+    out = [_round_numeric(dict(r)) for r in rows]
+    for row in out:
+        _serialize_dates(row, ("since", "until"))
+    return {"preferences": out}
+
+@app.post("/api/preferences", status_code=201)
+async def add_preference(body: PreferenceCreate):
+    if body.kind not in PREFERENCE_KINDS:
+        raise HTTPException(422, f"kind inconnu : {body.kind} — attendu {PREFERENCE_KINDS}")
+    if body.kind == "cap" and body.value is None:
+        raise HTTPException(422, "un plafond sans valeur ne plafonne rien")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        person_id = None
+        if body.person:
+            row = await conn.fetchrow(
+                "SELECT id FROM person WHERE LOWER(name) = LOWER($1)", body.person,
+            )
+            if not row:
+                raise HTTPException(404, f"Personne inconnue : {body.person}")
+            person_id = row["id"]
+        created = await conn.fetchrow(
+            """INSERT INTO dietary_preference
+                   (person_id, kind, target, value, unit, scope, reason)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (COALESCE(person_id, 0), kind, target) DO UPDATE
+               SET value = EXCLUDED.value, unit = EXCLUDED.unit,
+                   scope = EXCLUDED.scope, reason = EXCLUDED.reason,
+                   until = NULL, updated_at = NOW()
+               RETURNING id""",
+            person_id, body.kind, body.target, body.value,
+            body.unit, body.scope, body.reason,
+        )
+    return {"ok": True, "preference_id": created["id"]}
+
+@app.delete("/api/preferences/{preference_id}", status_code=204)
+async def delete_preference(preference_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM dietary_preference WHERE id = $1", preference_id,
+        )
+    if result == "DELETE 0":
+        raise HTTPException(404, "Préférence introuvable")
+
+@app.delete("/api/persons/{person_id}", status_code=204)
+async def delete_person(person_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM person WHERE id = $1", person_id)
+    if result == "DELETE 0":
+        raise HTTPException(404, "Person not found")
+
+@app.get("/api/households")
+async def list_households():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        households = await conn.fetch("SELECT * FROM household ORDER BY is_primary DESC, name")
+        result = []
+        for h in households:
+            members = await conn.fetch(
+                """SELECT hm.membership, p.id, p.name, p.role, p.circle
+                   FROM household_member hm JOIN person p ON p.id = hm.person_id
+                   WHERE hm.household_id = $1""",
+                h["id"],
+            )
+            d = dict(h)
+            d["members"] = [dict(m) for m in members]
+            result.append(d)
+    return result
+
+@app.post("/api/households/{household_id}/members", status_code=201)
+async def add_household_member(
+    household_id: int, person_id: int = Query(...), membership: str = "resident",
+):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO household_member (household_id, person_id, membership)
+               VALUES ($1, $2, $3) ON CONFLICT DO NOTHING""",
+            household_id, person_id, membership,
+        )
+    return {"ok": True}
+
+@app.delete("/api/households/{household_id}/members/{person_id}", status_code=204)
+async def remove_household_member(household_id: int, person_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM household_member WHERE household_id = $1 AND person_id = $2",
+            household_id, person_id,
+        )
+
+@app.get("/api/relationships")
+async def list_relationships():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT r.*, p1.name AS person_name, p2.name AS related_name
+               FROM relationship r
+               JOIN person p1 ON p1.id = r.person_id
+               JOIN person p2 ON p2.id = r.related_id""",
+        )
+    return [dict(r) for r in rows]
+
+@app.post("/api/relationships", status_code=201)
+async def create_relationship(body: RelationshipCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO relationship (person_id, related_id, type)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (person_id, related_id, type) DO NOTHING
+               RETURNING *""",
+            body.person_id, body.related_id, body.type,
+        )
+    return dict(row) if row else {"ok": True, "note": "already exists"}
+
+@app.delete("/api/relationships/{rel_id}", status_code=204)
+async def delete_relationship(rel_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM relationship WHERE id = $1", rel_id)
+
+@app.get("/api/custody-schedules")
+async def list_custody_schedules():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT cs.*, p.name AS person_name
+               FROM custody_schedule cs JOIN person p ON p.id = cs.person_id""",
+        )
+    return [_round_numeric(dict(r)) for r in rows]
+
+@app.post("/api/custody-schedules", status_code=201)
+async def create_custody_schedule(body: CustodyScheduleCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO custody_schedule (person_id, pattern, reference_date,
+                                            reference_present, notes)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (person_id) DO UPDATE SET
+                   pattern = EXCLUDED.pattern, reference_date = EXCLUDED.reference_date,
+                   reference_present = EXCLUDED.reference_present, notes = EXCLUDED.notes
+               RETURNING *""",
+            body.person_id, body.pattern,
+            datetime.date.fromisoformat(body.reference_date),
+            body.reference_present, body.notes,
+        )
+    return dict(row)
+
+@app.get("/api/canteen-schedules")
+async def list_canteen_schedules():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT cs.*, p.name AS person_name
+               FROM canteen_schedule cs JOIN person p ON p.id = cs.person_id""",
+        )
+    return [dict(r) for r in rows]
+
+@app.post("/api/canteen-schedules", status_code=201)
+async def create_canteen_schedule(body: CanteenScheduleCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO canteen_schedule (person_id, weekday, slot, active_outside_holidays)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (person_id, weekday, slot) DO UPDATE SET
+                   active_outside_holidays = EXCLUDED.active_outside_holidays
+               RETURNING *""",
+            body.person_id, body.weekday, body.slot, body.active_outside_holidays,
+        )
+    return dict(row)
+
+@app.get("/api/school-periods")
+async def list_school_periods():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM school_period ORDER BY start_date")
+    return [dict(r) for r in rows]
+
+@app.post("/api/school-periods", status_code=201)
+async def create_school_period(body: SchoolPeriodCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO school_period (label, start_date, end_date) "
+            "VALUES ($1, $2::date, $3::date) RETURNING *",
+            body.label, body.start_date, body.end_date,
+        )
+    return dict(row)
+
+@app.delete("/api/school-periods/{period_id}", status_code=204)
+async def delete_school_period(period_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM school_period WHERE id=$1", period_id)
+
+@app.get("/api/absences")
+async def list_absences():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT a.*, p.name AS person_name FROM absence a
+               JOIN person p ON p.id = a.person_id ORDER BY a.start_date""",
+        )
+    return [dict(r) for r in rows]
+
+@app.post("/api/absences", status_code=201)
+async def create_absence(body: AbsenceCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO absence (person_id, start_date, end_date, slot, reason)
+               VALUES ($1, $2::date, $3::date, $4, $5) RETURNING *""",
+            body.person_id, body.start_date, body.end_date, body.slot, body.reason,
+        )
+    return dict(row)
+
+@app.delete("/api/absences/{absence_id}", status_code=204)
+async def delete_absence(absence_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM absence WHERE id=$1", absence_id)
+
+@app.get("/api/stays")
+async def list_stays():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM stay ORDER BY start_date")
+        out = []
+        for s in rows:
+            members = await conn.fetch(
+                """SELECT p.id, p.name FROM stay_member sm
+                   JOIN person p ON p.id = sm.person_id WHERE sm.stay_id=$1""", s["id"],
+            )
+            d = dict(s)
+            d["members"] = [dict(m) for m in members]
+            out.append(d)
+    return out
+
+@app.post("/api/stays", status_code=201)
+async def create_stay(body: StayCreate):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        stay_id = await conn.fetchval(
+            """INSERT INTO stay (label, start_date, end_date, location, cooking)
+               VALUES ($1, $2::date, $3::date, $4, $5) RETURNING id""",
+            body.label, body.start_date, body.end_date, body.location, body.cooking,
+        )
+        for mid in body.member_ids:
+            await conn.execute(
+                "INSERT INTO stay_member (stay_id, person_id) VALUES ($1,$2) "
+                "ON CONFLICT DO NOTHING", stay_id, mid,
+            )
+    return {"id": stay_id, "members": len(body.member_ids)}
+
+@app.post("/api/stays/{stay_id}/members/{person_id}", status_code=201)
+async def add_stay_member(stay_id: int, person_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO stay_member (stay_id, person_id) VALUES ($1,$2) "
+            "ON CONFLICT DO NOTHING", stay_id, person_id,
+        )
+    return {"stay_id": stay_id, "person_id": person_id}
+
+@app.delete("/api/stays/{stay_id}", status_code=204)
+async def delete_stay(stay_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM stay WHERE id=$1", stay_id)
+
+@app.get("/api/attendance")
+async def resolve_attendance(day: str, slot: str = ""):
+    """Qui est à table le `day` (YYYY-MM-DD), pour un `slot` ou tous les créneaux."""
+    from datetime import date as _date
+
+    from cooking_manager.presence import SLOTS, attendees
+
+    try:
+        d = _date.fromisoformat(day)
+    except ValueError as e:
+        raise HTTPException(422, f"Date invalide : {day}") from e
+
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        household = await load_household_config(conn)
+        ref = await load_referential_from_db(conn)
+
+    stay = ref.stay_covering(d)
+    slots = [slot] if slot else list(SLOTS)
+    return {
+        "date": day,
+        "school_holiday": ref.holiday_label(d),
+        "stay": {"label": stay.label, "cooking": stay.cooking} if stay else None,
+        "slots": {s: attendees(d, s, ref, household) for s in slots},
+    }
+
+@app.post("/api/child-week/sync")
+async def sync_child_week(day: str | None = None):
+    """Synchronise la présence des enfants pour la semaine de `day` (ou"""
+    from datetime import date as _date
+
+    from backend.child_week_sync import ChildWeekAmbiguous, sync_week
+
+    try:
+        d = _date.fromisoformat(day) if day else _date.today()
+    except ValueError as e:
+        raise HTTPException(422, f"Date invalide : {day}") from e
+
+    pool = await get_pool(DATABASE_DSN)
+    try:
+        present = await sync_week(pool, d)
+    except ChildWeekAmbiguous as e:
+        raise HTTPException(422, str(e)) from e
+
+    monday = d - datetime.timedelta(days=d.weekday())
+    return {"week_monday": monday.isoformat(), "present": present}
+
+async def load_household_config(conn) -> HouseholdConfig:
+
+    adults_rows = await conn.fetch(
+        "SELECT name FROM person WHERE circle = 'household' AND role = 'adult' AND is_active",
+    )
+    children_rows = await conn.fetch(
+        """SELECT p.name, cs.pattern, cs.reference_date, cs.reference_present
+           FROM person p LEFT JOIN custody_schedule cs ON cs.person_id = p.id
+           WHERE p.circle = 'household' AND p.role = 'child' AND p.is_active""",
+    )
+    canteen_rows = await conn.fetch(
+        """SELECT p.name, cs.weekday, cs.slot, cs.active_outside_holidays
+           FROM canteen_schedule cs JOIN person p ON p.id = cs.person_id
+           WHERE p.is_active""",
+    )
+
+    adults = tuple(r["name"] for r in adults_rows)
+    children = []
+    for r in children_rows:
+        kwargs: dict = {"name": r["name"]}
+        if r["pattern"]:
+            kwargs["pattern"] = r["pattern"]
+            kwargs["reference_date"] = r["reference_date"]
+            kwargs["reference_present"] = r["reference_present"]
+        children.append(CustodyInfo(**kwargs))
+
+    canteen = [
+        CanteenEntry(name=r["name"], weekday=r["weekday"],
+                     slot=r["slot"], active_outside_holidays=r["active_outside_holidays"])
+        for r in canteen_rows
+    ]
+
+    if not adults:
+        return HouseholdConfig()
+    return HouseholdConfig(adults=adults, children=children, canteen=canteen)
+
+async def load_referential_from_db(conn) -> "Referential":
+    """Construit le référentiel de présence ENTIÈREMENT depuis la DB."""
+    from cooking_manager.presence import Absence, Referential, SchoolPeriod, Stay
+
+    ref = Referential()
+
+    for r in await conn.fetch("SELECT week_monday, present FROM child_week_presence"):
+        ref.gcal_weeks[r["week_monday"]] = r["present"]
+
+    for r in await conn.fetch("SELECT label, start_date, end_date FROM school_period"):
+        ref.school_holidays.append(SchoolPeriod(
+            label=r["label"], start=r["start_date"], end=r["end_date"],
+        ))
+
+    for r in await conn.fetch(
+        """SELECT p.name, a.start_date, a.end_date, a.slot, a.reason
+           FROM absence a JOIN person p ON p.id = a.person_id""",
+    ):
+        ref.absences.append(Absence(
+            who=r["name"], start=r["start_date"], end=r["end_date"],
+            reason=r["reason"] or "", slot=r["slot"],
+        ))
+
+    for s in await conn.fetch(
+        "SELECT id, label, start_date, end_date, cooking, location FROM stay",
+    ):
+        members = [
+            m["name"] for m in await conn.fetch(
+                """SELECT p.name FROM stay_member sm JOIN person p ON p.id = sm.person_id
+                   WHERE sm.stay_id = $1""", s["id"],
+            )
+        ]
+        ref.stays.append(Stay(
+            label=s["label"], start=s["start_date"], end=s["end_date"],
+            members=members, cooking=s["cooking"], location=s["location"] or "",
+        ))
+
+    for r in await conn.fetch(
+        """SELECT ma.day, ma.slot, p.name
+           FROM meal_attendance ma JOIN person p ON p.id = ma.person_id
+           WHERE ma.source IN ('manual', 'voice')""",
+    ):
+        ref.overrides.setdefault(f"{r['day'].isoformat()}/{r['slot']}", []).append(r["name"])
+
+    return ref
+
+async def load_convives_from_db(conn) -> dict:
+    """Profils alimentaires depuis `person` — remplace parse_convives(Convives.md)."""
+    from cooking_manager.convives import Convive
+
+    rows = await conn.fetch(
+        """SELECT name, diet, dislikes, forbidden, diet_exceptions, circle
+           FROM person WHERE is_active""",
+    )
+    convives = {}
+    for r in rows:
+        convives[r["name"]] = Convive(
+            name=r["name"],
+            diet=r["diet"] or "standard",
+            dislikes=list(r["dislikes"] or []),
+            forbidden=list(r["forbidden"] or []),
+            diet_exceptions=list(r["diet_exceptions"] or []),
+            is_guest=(r["circle"] != "household"),
+        )
+    return convives
+
+SEED_PERSONS = [
+    {"name": "Julien",   "circle": "household", "role": "adult", "default_attendance": "always"},
+    {"name": "Claire", "circle": "household", "role": "adult", "default_attendance": "always",
+     "diet": "pescetarian",
+     "dislikes": ["oeuf dur", "oeuf poché", "oeuf au plat", "oeuf mollet"],
+     "diet_exceptions": ["boudin", "quenelle de veau", "quenelle de volaille"]},
+    {"name": "Lou",      "circle": "household", "role": "child", "default_attendance": "scheduled",
+     "dislikes": ["oeuf dur", "oeuf poché", "oeuf au plat", "oeuf mollet", "mais"]},
+    {"name": "Tom",  "circle": "household", "role": "child", "default_attendance": "scheduled"},
+]
+
+SEED_RELATIONSHIPS = [
+    ("Julien", "Lou",      "parent_of"),
+    ("Julien", "Tom",  "parent_of"),
+    ("Claire", "Lou",    "parent_of"),
+    ("Claire", "Tom","parent_of"),
+    ("Julien", "Claire", "partner"),
+    ("Lou",    "Tom",  "sibling"),
+]
+
+SEED_CUSTODY_REFERENCE = datetime.date(2026, 1, 13)
+SEED_CANTEEN_WEEKDAYS = [1, 3, 4]
+
+SEED_SCHOOL_PERIODS = [
+    ("Vacances d'été", datetime.date(2026, 7, 4), datetime.date(2026, 8, 31)),
+]
+
+SEED_STAYS = [
+    {
+        "label": "Semaine à Talence",
+        "start": datetime.date(2026, 8, 8), "end": datetime.date(2026, 8, 16),
+        "location": "Talence (location de vacances)", "cooking": True,
+        "members": ["Julien", "Claire", "Lou", "Tom"],
+    },
+]
+
+@app.post("/api/seed")
+async def seed_household():
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        created_persons = 0
+        for p in SEED_PERSONS:
+            result = await conn.execute(
+                """INSERT INTO person (name, circle, role, diet, dislikes, forbidden,
+                                       diet_exceptions, default_attendance)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   ON CONFLICT (name, circle) DO UPDATE SET
+                       role = EXCLUDED.role, diet = EXCLUDED.diet,
+                       default_attendance = EXCLUDED.default_attendance, updated_at = NOW()""",
+                p["name"], p["circle"], p["role"],
+                p.get("diet", "omnivore"), p.get("dislikes", []),
+                p.get("forbidden", []), p.get("diet_exceptions", []),
+                p["default_attendance"],
+            )
+            if "INSERT" in result:
+                created_persons += 1
+
+        hh = await conn.fetchrow(
+            "INSERT INTO household (name, is_primary) VALUES ('Foyer', TRUE) "
+            "ON CONFLICT DO NOTHING RETURNING id",
+        )
+        hh_id = hh["id"] if hh else (
+            await conn.fetchval("SELECT id FROM household WHERE is_primary")
+        )
+
+        for p in SEED_PERSONS:
+            pid = await conn.fetchval(
+                "SELECT id FROM person WHERE name = $1 AND circle = 'household'", p["name"],
+            )
+            if pid:
+                await conn.execute(
+                    "INSERT INTO household_member (household_id, person_id, membership) "
+                    "VALUES ($1, $2, 'resident') ON CONFLICT DO NOTHING",
+                    hh_id, pid,
+                )
+
+        created_rels = 0
+        for name1, name2, rel_type in SEED_RELATIONSHIPS:
+            p1 = await conn.fetchval("SELECT id FROM person WHERE name=$1 AND circle='household'", name1)
+            p2 = await conn.fetchval("SELECT id FROM person WHERE name=$1 AND circle='household'", name2)
+            if p1 and p2:
+                r = await conn.execute(
+                    "INSERT INTO relationship (person_id, related_id, type) "
+                    "VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", p1, p2, rel_type,
+                )
+                if "INSERT" in r:
+                    created_rels += 1
+
+        created_custody = 0
+        for p in SEED_PERSONS:
+            if p["role"] != "child":
+                continue
+            pid = await conn.fetchval(
+                "SELECT id FROM person WHERE name=$1 AND circle='household'", p["name"],
+            )
+            if pid:
+                r = await conn.execute(
+                    "INSERT INTO custody_schedule (person_id, pattern, reference_date, reference_present) "
+                    "VALUES ($1, 'alternating_weeks', $2, TRUE) ON CONFLICT (person_id) DO NOTHING",
+                    pid, SEED_CUSTODY_REFERENCE,
+                )
+                if "INSERT" in r:
+                    created_custody += 1
+
+        created_canteen = 0
+        for p in SEED_PERSONS:
+            if p["role"] != "child":
+                continue
+            pid = await conn.fetchval(
+                "SELECT id FROM person WHERE name=$1 AND circle='household'", p["name"],
+            )
+            if not pid:
+                continue
+            for wd in SEED_CANTEEN_WEEKDAYS:
+                r = await conn.execute(
+                    "INSERT INTO canteen_schedule (person_id, weekday, slot, active_outside_holidays) "
+                    "VALUES ($1, $2, 'lunch', TRUE) ON CONFLICT DO NOTHING",
+                    pid, wd,
+                )
+                if "INSERT" in r:
+                    created_canteen += 1
+
+        created_periods = 0
+        for label, start, end in SEED_SCHOOL_PERIODS:
+            r = await conn.execute(
+                """INSERT INTO school_period (label, start_date, end_date)
+                   SELECT $1, $2, $3
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM school_period WHERE label=$1 AND start_date=$2)""",
+                label, start, end,
+            )
+            if "INSERT 0 1" in r:
+                created_periods += 1
+
+        created_stays = 0
+        for s in SEED_STAYS:
+            stay_id = await conn.fetchval(
+                "SELECT id FROM stay WHERE label=$1 AND start_date=$2", s["label"], s["start"],
+            )
+            if not stay_id:
+                stay_id = await conn.fetchval(
+                    """INSERT INTO stay (label, start_date, end_date, location, cooking)
+                       VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+                    s["label"], s["start"], s["end"], s["location"], s["cooking"],
+                )
+                created_stays += 1
+            for member in s["members"]:
+                mid = await conn.fetchval("SELECT id FROM person WHERE name=$1", member)
+                if mid:
+                    await conn.execute(
+                        "INSERT INTO stay_member (stay_id, person_id) VALUES ($1,$2) "
+                        "ON CONFLICT DO NOTHING", stay_id, mid,
+                    )
+
+    return {
+        "persons": created_persons,
+        "household_id": hh_id,
+        "relationships": created_rels,
+        "custody_schedules": created_custody,
+        "canteen_schedules": created_canteen,
+        "school_periods": created_periods,
+        "stays": created_stays,
+    }
+
+logger = logging.getLogger("cooking_manager.app")
+
+FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1")
+PARSER_LLM_MODEL = os.environ.get("LLM_MODEL", "gemma3:cloud")
+
+class ParseUrlRequest(BaseModel):
+    url: str
+    enable_llm: bool = False
+
+class ParseHtmlRequest(BaseModel):
+    html: str
+    url: str = ""
+    enable_llm: bool = False
+
+async def _parse_url(req: ParseUrlRequest):
+    recipe = await parse_recipe_url(
+        req.url,
+        enable_llm=req.enable_llm,
+        ollama_host=OLLAMA_URL,
+        llm_model=PARSER_LLM_MODEL,
+        flaresolverr_url=FLARESOLVERR_URL,
+    )
+    if not recipe:
+        raise HTTPException(422, "Could not extract recipe from URL")
+    return recipe
+
+@app.post("/api/recipes/parse")
+async def parse_recipe_from_url(req: ParseUrlRequest):
+    """URL → recette extraite, rendue telle quelle, sans rien persister."""
+    return dataclasses.asdict(await _parse_url(req))
+
+@app.post("/api/recipes/parse-html")
+async def parse_recipe_from_html(req: ParseHtmlRequest):
+    """HTML déjà téléchargé → recette extraite. Forme de payload consommée par Waaker."""
+    recipe = await asyncio.to_thread(
+        parse_recipe_html,
+        req.html,
+        req.url or None,
+        enable_llm=req.enable_llm,
+        ollama_host=OLLAMA_URL,
+        llm_model=PARSER_LLM_MODEL,
+    )
+    if not recipe:
+        raise HTTPException(422, "Could not extract recipe from HTML")
+    return dataclasses.asdict(recipe)
+
+def _draft_row(row) -> dict:
+    d = dict(row)
+    if isinstance(d.get("draft"), str):
+        d["draft"] = json.loads(d["draft"])
+    _serialize_dates(d, ("created_at", "updated_at"))
+    return d
+
+async def _insert_draft(draft: dict, source: str | None, page_count: int) -> dict:
+    pool = await get_pool(DATABASE_DSN)
+    row = await pool.fetchrow(
+        """INSERT INTO import_draft (slug, title, source, draft, page_count)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *""",
+        draft["slug"], draft["title"], source or None,
+        json.dumps(draft), page_count,
+    )
+    return _draft_row(row)
+
+@app.post("/api/recipes/import/url", status_code=201)
+async def import_recipe_url(req: ParseUrlRequest):
+    """URL → brouillon révisable, le même garde-fou que le livre photographié (SC-33)."""
+    recipe = await _parse_url(req)
+    draft = url_to_draft(recipe)
+    if not draft["title"]:
+        raise HTTPException(422, "no title could be extracted from the URL")
+    return await _insert_draft(draft, req.url, 0)
+
+_IMPORT_TASKS: dict[str, dict] = {}
+_IMPORT_TASK_REFS: dict[str, asyncio.Task] = {}
+_IMPORT_TASKS_KEPT = 50
+_BUG_EXCEPTIONS = (NameError, AttributeError, TypeError, ImportError)
+
+def _forget_oldest_tasks() -> None:
+    while len(_IMPORT_TASKS) > _IMPORT_TASKS_KEPT:
+        oldest = next(iter(_IMPORT_TASKS))
+        if oldest in _IMPORT_TASK_REFS:
+            break
+        del _IMPORT_TASKS[oldest]
+
+async def _read_page_task(task_id: str, pages: list[tuple[bytes, str]], source: str) -> None:
+    try:
+        page = await book_import.read_page(pages)
+        draft = book_import.to_draft(page)
+        if not draft["title"]:
+            raise ValueError("no title could be read from the page")
+        row = await _insert_draft(draft, source, len(pages))
+        _IMPORT_TASKS[task_id] = {"status": "done", "draft": row, "detail": None}
+    except Exception as exc:
+        _IMPORT_TASKS[task_id] = {"status": "failed", "draft": None, "detail": str(exc)}
+        logger.warning("import page task %s failed: %s", task_id, exc)
+        if isinstance(exc, _BUG_EXCEPTIONS):
+            raise
+    finally:
+        _IMPORT_TASK_REFS.pop(task_id, None)
+
+@app.post("/api/recipes/import/page", status_code=202)
+async def import_book_page(files: list[UploadFile], source: str = Form("")):
+    """Photo(s) de page → tâche de lecture. La durée du décodage d'image n'est pas mesurée."""
+    pages = [(await f.read(), f.content_type or "image/jpeg") for f in files]
+    pages = [(raw, mime) for raw, mime in pages if raw]
+    if not pages:
+        raise HTTPException(400, "aucune image reçue")
+    task_id = uuid.uuid4().hex
+    _IMPORT_TASKS[task_id] = {"status": "running", "draft": None, "detail": None}
+    _forget_oldest_tasks()
+    _IMPORT_TASK_REFS[task_id] = asyncio.create_task(
+        _read_page_task(task_id, pages, source)
+    )
+    return {"task_id": task_id, "status": "running"}
+
+@app.get("/api/recipes/import/tasks/{task_id}")
+async def get_import_task(task_id: str):
+    task = _IMPORT_TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(404, "task not found")
+    return {"task_id": task_id, **task}
+
+@app.get("/api/recipes/import/drafts")
+async def list_import_drafts(status: str = "pending"):
+    pool = await get_pool(DATABASE_DSN)
+    rows = await pool.fetch(
+        "SELECT * FROM import_draft WHERE status = $1 ORDER BY created_at DESC", status
+    )
+    return {"drafts": [_draft_row(r) for r in rows], "count": len(rows)}
+
+@app.get("/api/recipes/import/drafts/{draft_id}")
+async def get_import_draft(draft_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    row = await pool.fetchrow("SELECT * FROM import_draft WHERE id = $1", draft_id)
+    if not row:
+        raise HTTPException(404, "draft not found")
+    return _draft_row(row)
+
+@app.patch("/api/recipes/import/drafts/{draft_id}")
+async def update_import_draft(draft_id: int, data: dict):
+    """Corrections humaines. Le brouillon reçu remplace le précédent."""
+    pool = await get_pool(DATABASE_DSN)
+    current = await pool.fetchrow("SELECT * FROM import_draft WHERE id = $1", draft_id)
+    if not current:
+        raise HTTPException(404, "draft not found")
+    if current["status"] != "pending":
+        raise HTTPException(409, f"draft already {current['status']}")
+
+    stored = json.loads(current["draft"]) if isinstance(current["draft"], str) else current["draft"]
+    draft = {**stored, **(data.get("draft") or data)}
+    if not (draft.get("title") or "").strip():
+        raise HTTPException(422, "un brouillon sans titre ne peut pas être enregistré")
+    draft["unparsed_count"] = sum(
+        1 for i in draft.get("ingredients", []) if not i.get("parsed")
+    )
+    row = await pool.fetchrow(
+        """UPDATE import_draft
+              SET draft = $2, title = $3, slug = $4, updated_at = NOW()
+            WHERE id = $1 RETURNING *""",
+        draft_id, json.dumps(draft), draft.get("title"), draft.get("slug"),
+    )
+    return _draft_row(row)
+
+@app.delete("/api/recipes/import/drafts/{draft_id}")
+async def discard_import_draft(draft_id: int):
+    pool = await get_pool(DATABASE_DSN)
+    result = await pool.execute(
+        "UPDATE import_draft SET status = 'discarded', updated_at = NOW() WHERE id = $1",
+        draft_id,
+    )
+    if result.endswith("0"):
+        raise HTTPException(404, "draft not found")
+    return {"status": "discarded", "id": draft_id}
+
+@app.post("/api/recipes/import/drafts/{draft_id}/commit")
+async def commit_import_draft(draft_id: int, overwrite: bool = False):
+    """Brouillon validé → recette en DB (ADR 0022 — vault déconnecté)."""
+    pool = await get_pool(DATABASE_DSN)
+    row = await pool.fetchrow("SELECT * FROM import_draft WHERE id = $1", draft_id)
+    if not row:
+        raise HTTPException(404, "draft not found")
+    if row["status"] == "committed":
+        raise HTTPException(409, f"already committed as {row['committed_path']}")
+
+    draft = json.loads(row["draft"]) if isinstance(row["draft"], str) else row["draft"]
+    slug = draft.get("slug")
+    if not slug:
+        raise HTTPException(422, "draft has no slug")
+    if not (draft.get("title") or "").strip():
+        raise HTTPException(422, "draft has no title")
+
+    existing = await pool.fetchval("SELECT id FROM recipe WHERE slug = $1", slug)
+    if existing and not overwrite:
+        raise HTTPException(409, f"recipe '{slug}' already exists — pass overwrite=true")
+
+    body = book_import.to_markdown(draft, source=row["source"])
+    content = parse_recipe_body(body)
+
+    async with pool.acquire() as conn, conn.transaction():
+        if existing:
+            await conn.execute(
+                """UPDATE recipe SET title=$1, status='a-tester', recipe_type=$2,
+                   servings=$3, prep_time_min=$4, cook_time_min=$5,
+                   sources=$6, body=$7, updated=CURRENT_DATE, ingested_at=NOW()
+                   WHERE slug=$8""",
+                draft.get("title", slug), draft.get("recipe_type"),
+                draft.get("servings"), draft.get("prep_time_min"),
+                draft.get("cook_time_min"),
+                [row["source"]] if row["source"] else [],
+                body, slug,
+            )
+            recipe_id = existing
+        else:
+            recipe_id = await conn.fetchval(
+                """INSERT INTO recipe (slug, title, status, recipe_type, servings,
+                   prep_time_min, cook_time_min, sources, body, created, updated)
+                   VALUES ($1,$2,'a-tester',$3,$4,$5,$6,$7,$8,CURRENT_DATE,CURRENT_DATE)
+                   RETURNING id""",
+                slug, draft.get("title", slug), draft.get("recipe_type"),
+                draft.get("servings"), draft.get("prep_time_min"),
+                draft.get("cook_time_min"),
+                [row["source"]] if row["source"] else [],
+                body,
+            )
+
+        await write_recipe_ingredients(conn, recipe_id, content.ingredients)
+
+        await conn.execute("DELETE FROM recipe_step WHERE recipe_id = $1", recipe_id)
+        for step in content.steps:
+            await conn.execute(
+                "INSERT INTO recipe_step (recipe_id, position, text) VALUES ($1,$2,$3)",
+                recipe_id, step.position, step.text,
+            )
+
+        await conn.execute(
+            """UPDATE import_draft
+                  SET status = 'committed', committed_path = $2, updated_at = NOW()
+                WHERE id = $1""",
+            draft_id, f"db:recipe:{slug}",
+        )
+
+    return {"status": "committed", "id": draft_id, "slug": slug, "via": "database",
+            "visible": bool(await pool.fetchval("SELECT 1 FROM recipe WHERE slug = $1", slug))}
+
+@app.post("/api/recipes/{slug}/generate-image")
+async def generate_recipe_image(slug: str, force: bool = False, inline: bool = False):
+    """Génère la photo de la recette sous « <slug>.jpg » ; `force` remplace une photo existante."""
+    pool = await get_pool(DATABASE_DSN)
+    row = await pool.fetchrow("SELECT id, title, photo_url FROM recipe WHERE slug = $1", slug)
+    if not row:
+        raise HTTPException(404, f"Recipe '{slug}' not found")
+
+    if row["photo_url"] and not force:
+        return {"slug": slug, "photo_url": row["photo_url"], "generated": False,
+                "reason": "already has a photo — pass force=true to replace it"}
+
+    ing_rows = await pool.fetch(
+        "SELECT name FROM recipe_ingredient WHERE recipe_id = $1 ORDER BY position LIMIT 5",
+        row["id"],
+    )
+    ingredients = [r["name"] for r in ing_rows if r["name"]]
+
+    try:
+        jpeg = await images.generate(row["title"], ingredients)
+    except images.ImageGenerationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    path = images.write(slug, jpeg)
+    photo_url = f"/media/recipes/{slug}.jpg"
+    await pool.execute("UPDATE recipe SET photo_url = $1 WHERE slug = $2", photo_url, slug)
+    logger.info("Generated image for %s (%d bytes) -> %s", slug, len(jpeg), path)
+
+    result = {
+        "slug": slug,
+        "photo_url": photo_url,
+        "path": str(path),
+        "bytes": len(jpeg),
+        "generated": True,
+        "prompt_version": images.PROMPT_VERSION,
+    }
+    if inline:
+        result["image_base64"] = base64.b64encode(jpeg).decode("ascii")
+    return result
+
+class FoodBody(BaseModel):
+    key: str | None = None
+    name: str
+    category: str | None = None
+    kind: str | None = None
+    ciqual_code: str | None = None
+    conservation: str | None = None
+    source: str | None = None
+    pantry_staple: bool | None = None
+
+
+class FormBody(BaseModel):
+    label: str = "100g"
+    kcal: float | None = None
+    protein: float | None = None
+    carbs: float | None = None
+    fat: float | None = None
+
+
+class ProductPatch(BaseModel):
+    food_key: str | None = None
+    status: str | None = None
+    nature: str | None = None
+    name: str | None = None
+    brand: str | None = None
+
+
+FOOD_STATUSES = ("linked", "a_rapprocher")
+
+
+async def _food_or_404(conn, key: str) -> dict:
+    row = await conn.fetchrow("SELECT * FROM food WHERE key = $1", key)
+    if row is None:
+        raise HTTPException(404, f"Aliment introuvable : {key}")
+    return dict(row)
+
+
+async def _forms_of(conn, key: str) -> list[dict]:
+    rows = await conn.fetch(
+        """SELECT label, kcal, protein, carbs, fat FROM food_form
+            WHERE food_key = $1 ORDER BY label""", key)
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/food")
+async def list_food(q: str | None = None, limit: int = 200):
+    """Aliments et le nombre de formes de chacun — zero forme = aucune macro."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT f.key, f.name, f.category, f.kind, f.ciqual_code, f.source,
+                      f.pantry_staple, count(ff.label) AS forms
+                 FROM food f LEFT JOIN food_form ff ON ff.food_key = f.key
+                WHERE $1::text IS NULL OR f.key ILIKE '%' || $1 || '%'
+                     OR f.name ILIKE '%' || $1 || '%'
+                GROUP BY f.key ORDER BY f.key LIMIT $2""", q, limit)
+    return {"count": len(rows), "foods": [dict(r) for r in rows]}
+
+
+def _food_kind(value: object, origin: str) -> str | None:
+    """`food.kind` est un axe fermé du vocabulaire — une famille inventée est refusée (ADR 0033)."""
+    from cooking_manager.matching import clean_kind
+
+    try:
+        return clean_kind(value, origin)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from None
+
+@app.post("/api/food", status_code=201)
+async def create_food(body: FoodBody):
+    from cooking_manager.ingredients import normalize_name
+
+    key = body.key or normalize_name(body.name)
+    if not key:
+        raise HTTPException(400, "Clé vide après normalisation")
+    kind = _food_kind(body.kind, f"food/{key}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        if await conn.fetchval("SELECT 1 FROM food WHERE key = $1", key):
+            raise HTTPException(409, f"Aliment déjà existant : {key}")
+        await conn.execute(
+            """INSERT INTO food (key, name, category, kind, ciqual_code,
+                                 conservation, source, pantry_staple)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+            key, body.name, body.category, kind, body.ciqual_code,
+            body.conservation, body.source or "api", bool(body.pantry_staple))
+    return {"key": key, "name": body.name, "forms": []}
+
+
+@app.get("/api/food/{key}")
+async def get_food(key: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        food = await _food_or_404(conn, key)
+        food["forms"] = await _forms_of(conn, key)
+        food["products"] = [dict(r) for r in await conn.fetch(
+            "SELECT id, name, brand, status FROM product WHERE food_key = $1", key)]
+    _serialize_dates(food, ("verified_at", "created_at"))
+    return food
+
+
+@app.put("/api/food/{key}")
+async def update_food(key: str, body: FoodBody):
+    kind = _food_kind(body.kind, f"food/{key}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await _food_or_404(conn, key)
+        await conn.execute(
+            """UPDATE food SET name=$2, category=$3, kind=$4, ciqual_code=$5,
+                               conservation=$6, source=COALESCE($7, source),
+                               pantry_staple = COALESCE($8, pantry_staple)
+                WHERE key=$1""",
+            key, body.name, body.category, kind, body.ciqual_code,
+            body.conservation, body.source, body.pantry_staple)
+        forms = await _forms_of(conn, key)
+    return {"key": key, "name": body.name, "forms": forms, "updated": True}
+
+
+@app.delete("/api/food/{key}")
+async def delete_food(key: str):
+    """Les formes partent avec l'aliment ; les produits restent, détachés."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await _food_or_404(conn, key)
+        detached = await conn.fetchval(
+            "SELECT count(*) FROM product WHERE food_key = $1", key)
+        await conn.execute("DELETE FROM food WHERE key = $1", key)
+    return {"deleted": key, "detached_products": detached}
+
+
+@app.get("/api/food/{key}/form")
+async def list_food_forms(key: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await _food_or_404(conn, key)
+        return {"food_key": key, "forms": await _forms_of(conn, key)}
+
+
+@app.post("/api/food/{key}/form")
+async def upsert_food_form(key: str, body: FormBody):
+    """Une forme déjà posée est corrigée, jamais doublée — (food_key, label) est la clé."""
+    if not body.label.strip():
+        raise HTTPException(400, "Label de forme vide")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        await _food_or_404(conn, key)
+        await conn.execute(
+            """INSERT INTO food_form (food_key, label, kcal, protein, carbs, fat)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT (food_key, label) DO UPDATE SET
+                 kcal = EXCLUDED.kcal, protein = EXCLUDED.protein,
+                 carbs = EXCLUDED.carbs, fat = EXCLUDED.fat""",
+            key, body.label.strip(), body.kcal, body.protein, body.carbs, body.fat)
+        forms = await _forms_of(conn, key)
+    return {"food_key": key, "forms": forms}
+
+
+@app.delete("/api/food/{key}/form/{label}")
+async def delete_food_form(key: str, label: str):
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        deleted = await conn.fetchval(
+            """DELETE FROM food_form WHERE food_key = $1 AND label = $2
+               RETURNING label""", key, label)
+    if deleted is None:
+        raise HTTPException(404, f"Forme introuvable : {key} / {label}")
+    return {"deleted": {"food_key": key, "label": label}}
+
+
+ARBITRATION_SCOPE = {"food_key": "label", "food_kind": "food"}
+
+
+class ArbitrationDecision(BaseModel):
+    subject: str
+    ref: str
+    decision: str | None = None
+    reason: str | None = None
+
+
+class ArbitrationBatch(BaseModel):
+    decided_by: str = "claude-code"
+    decisions: list[ArbitrationDecision]
+
+
+def _arbitration_subject(subject: str) -> str:
+    scope = ARBITRATION_SCOPE.get(subject)
+    if scope is None:
+        raise HTTPException(422, f"Sujet inconnu : {subject!r}, attendu parmi "
+                                 f"{sorted(ARBITRATION_SCOPE)}")
+    return scope
+
+
+async def _settled_refs(conn, subject: str) -> set[str]:
+    rows = await conn.fetch(
+        "SELECT ref FROM arbitration WHERE subject = $1 AND status = 'settled'", subject)
+    return {r["ref"] for r in rows}
+
+
+async def _queue(conn, subject: str, ref: str, label: str, proposal, rows: int,
+                 origin: str = "") -> None:
+    await conn.execute(
+        """INSERT INTO arbitration (subject, scope, ref, label, candidates, reason)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+           ON CONFLICT (subject, scope, ref) DO UPDATE
+              SET label = EXCLUDED.label, candidates = EXCLUDED.candidates,
+                  reason = EXCLUDED.reason
+            WHERE arbitration.status = 'pending'""",
+        subject, _arbitration_subject(subject), ref, label,
+        json.dumps([c.as_dict() for c in proposal.candidates], ensure_ascii=False),
+        f"{proposal.reason} — {origin or f'{rows} ligne(s)'}")
+
+
+async def _settle(conn, subject: str, ref: str, label: str, proposal,
+                  decided_by: str) -> None:
+    await conn.execute(
+        """INSERT INTO arbitration (subject, scope, ref, label, candidates, reason,
+                                    status, decision, decided_by, decided_at)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'settled', $7, $8, NOW())
+           ON CONFLICT (subject, scope, ref) DO UPDATE
+              SET status = 'settled', decision = EXCLUDED.decision,
+                  decided_by = EXCLUDED.decided_by, decided_at = NOW(),
+                  reason = EXCLUDED.reason, candidates = EXCLUDED.candidates""",
+        subject, _arbitration_subject(subject), ref, label,
+        json.dumps([c.as_dict() for c in proposal.candidates], ensure_ascii=False),
+        proposal.reason, proposal.decision, decided_by)
+
+
+async def _apply_food_key(conn, ref: str, decision: str | None) -> dict:
+    pantry = await conn.execute(
+        "UPDATE pantry_item SET food_key = $1 WHERE name_normalized = $2", decision, ref)
+    ingredients = await conn.execute(
+        "UPDATE recipe_ingredient SET food_key = $1 WHERE name_normalized = $2",
+        decision, ref)
+    return {"pantry_item": _row_count(pantry), "recipe_ingredient": _row_count(ingredients)}
+
+
+def _row_count(tag: str) -> int:
+    return int(tag.rsplit(" ", 1)[-1]) if tag else 0
+
+
+SUBSTITUTION_ORIGIN = "cible de substitution de régime, injectée hors table d'ingrédients"
+
+
+async def _refresh_food_key(conn) -> dict:
+    from cooking_manager.ingredients import normalize_name
+    from cooking_manager.linking import needs_arbitration, propose_food_key
+    from cooking_manager.substitutions import substitution_targets
+
+    foods = {r["key"]: r["name"] or r["key"]
+             for r in await conn.fetch("SELECT key, name FROM food")}
+    recurrent = {normalize_name(r["key"]) for r in await conn.fetch(
+        "SELECT key FROM shopping_preference WHERE active = TRUE AND pref_type = 'recurrent'")}
+    settled = await _settled_refs(conn, "food_key")
+    rows = await conn.fetch(
+        """SELECT name_normalized AS ref, min(name) AS label, count(*) AS rows,
+                  bool_or(in_recipe) AS in_recipe
+             FROM (SELECT name_normalized, name, FALSE AS in_recipe
+                     FROM pantry_item WHERE food_key IS NULL
+                   UNION ALL
+                   SELECT name_normalized, name, TRUE
+                     FROM recipe_ingredient WHERE food_key IS NULL) t
+            WHERE name_normalized <> ''
+            GROUP BY name_normalized ORDER BY 3 DESC""")
+
+    queue = [{"ref": r["ref"], "label": r["label"], "rows": r["rows"], "origin": "",
+              "in_recipe": r["in_recipe"]} for r in rows]
+    seen = {r["ref"] for r in rows}
+    for target in substitution_targets():
+        ref = normalize_name(target)
+        if ref and ref not in seen:
+            seen.add(ref)
+            queue.append({"ref": ref, "label": target, "rows": 0,
+                          "origin": SUBSTITUTION_ORIGIN, "in_recipe": True})
+
+    queued = linked = skipped = 0
+    for row in queue:
+        ref = row["ref"]
+        if not needs_arbitration(ref, settled=settled, recurrent=recurrent,
+                                 in_recipe=row["in_recipe"]):
+            skipped += 1
+            continue
+        proposal = propose_food_key(row["label"] or ref, foods)
+        if proposal.settled:
+            await _apply_food_key(conn, ref, proposal.decision)
+            await _settle(conn, "food_key", ref, row["label"] or ref, proposal, "exact")
+            linked += 1
+            continue
+        await _queue(conn, "food_key", ref, row["label"] or ref, proposal, row["rows"],
+                     row["origin"])
+        queued += 1
+    return {"subject": "food_key", "queued": queued, "linked": linked,
+            "already_settled_or_recurrent": skipped}
+
+
+async def _refresh_food_kind(conn) -> dict:
+    from cooking_manager.linking import propose_food_kind
+    from cooking_manager.matching import facet_concepts
+
+    kinds = facet_concepts("food_kinds")
+    settled = await _settled_refs(conn, "food_kind")
+    rows = await conn.fetch(
+        "SELECT key, name, category FROM food WHERE kind IS NULL ORDER BY key")
+
+    queued = qualified = skipped = 0
+    for row in rows:
+        if row["key"] in settled:
+            skipped += 1
+            continue
+        proposal = propose_food_kind(row["name"] or row["key"], row["category"], kinds)
+        label = row["name"] or row["key"]
+        if proposal.settled:
+            await conn.execute("UPDATE food SET kind = $1 WHERE key = $2",
+                               proposal.decision, row["key"])
+            await _settle(conn, "food_kind", row["key"], label, proposal, "exact")
+            qualified += 1
+            continue
+        await _queue(conn, "food_kind", row["key"], label, proposal, 1)
+        queued += 1
+    return {"subject": "food_kind", "queued": queued, "qualified": qualified,
+            "already_settled": skipped}
+
+
+@app.post("/api/arbitration/refresh")
+async def refresh_arbitration(subject: str | None = None):
+    """Reconstruit la file : l'exact se tranche seul, tout le reste se nomme et attend."""
+    subjects = [subject] if subject else list(ARBITRATION_SCOPE)
+    for name in subjects:
+        _arbitration_subject(name)
+    pool = await get_pool(DATABASE_DSN)
+    out = []
+    async with pool.acquire() as conn:
+        for name in subjects:
+            out.append(await _refresh_food_key(conn) if name == "food_key"
+                       else await _refresh_food_kind(conn))
+    return {"refreshed": out}
+
+
+@app.get("/api/arbitration")
+async def list_arbitration(subject: str | None = None, limit: int = 500):
+    """`pending` se lit AVANT `groups` : une file vide n'est pas un référentiel complet."""
+    from cooking_manager.linking import group_by_candidate, link_counts
+
+    if subject:
+        _arbitration_subject(subject)
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        counts = await conn.fetch(
+            """SELECT subject,
+                      count(*) FILTER (WHERE status = 'pending') AS pending,
+                      count(*) FILTER (WHERE status = 'settled') AS settled
+                 FROM arbitration
+                WHERE $1::text IS NULL OR subject = $1
+                GROUP BY subject ORDER BY subject""", subject)
+        rows = await conn.fetch(
+            """SELECT subject, scope, ref, label, candidates, reason
+                 FROM arbitration
+                WHERE status = 'pending' AND ($1::text IS NULL OR subject = $1)
+                ORDER BY subject, label LIMIT $2""", subject, limit)
+
+    entries = [{"subject": r["subject"], "scope": r["scope"], "ref": r["ref"],
+                "label": r["label"], "reason": r["reason"],
+                "candidates": json.loads(r["candidates"])} for r in rows]
+    return {
+        "counts": {c["subject"]: link_counts(c["pending"], c["settled"]) for c in counts},
+        "shown": len(entries),
+        "groups": group_by_candidate(entries),
+    }
+
+
+@app.post("/api/arbitration/decisions")
+async def decide_arbitration(body: ArbitrationBatch):
+    """Trancher par lot. `decision: null` = instruit, hors référentiel — jamais un oubli."""
+    pool = await get_pool(DATABASE_DSN)
+    applied = []
+    async with pool.acquire() as conn:
+        known = {r["key"] for r in await conn.fetch("SELECT key FROM food")}
+        for item in body.decisions:
+            scope = _arbitration_subject(item.subject)
+            decision = item.decision
+            if decision is None and not (item.reason or "").strip():
+                raise HTTPException(
+                    422, f"{item.subject}/{item.ref} : un refus doit dire pourquoi — "
+                         "sans motif, « hors référentiel » se lit comme un oubli")
+            if item.subject == "food_key" and decision is not None and decision not in known:
+                raise HTTPException(422, f"Aliment inconnu du référentiel : {decision!r}")
+            if item.subject == "food_kind" and decision is not None:
+                decision = _food_kind(decision, f"arbitration/{item.ref}")
+
+            queued = await conn.fetchval(
+                "SELECT id FROM arbitration WHERE subject = $1 AND scope = $2 AND ref = $3",
+                item.subject, scope, item.ref)
+            if queued is None:
+                raise HTTPException(404, f"Aucune entrée en file : {item.subject}/{item.ref}")
+
+            touched: dict[str, int] = {}
+            if item.subject == "food_key":
+                touched = await _apply_food_key(conn, item.ref, decision)
+            elif decision is not None:
+                await conn.execute("UPDATE food SET kind = $1 WHERE key = $2",
+                                   decision, item.ref)
+                touched = {"food": 1}
+
+            settled = await conn.fetchval(
+                """UPDATE arbitration
+                      SET status = 'settled', decision = $4, decided_by = $5,
+                          decided_at = NOW(), reason = COALESCE($6, reason)
+                    WHERE subject = $1 AND scope = $2 AND ref = $3
+                RETURNING id""",
+                item.subject, scope, item.ref, decision, body.decided_by, item.reason)
+            if settled is None:
+                raise HTTPException(404, f"Aucune entrée en file : {item.subject}/{item.ref}")
+            applied.append({"subject": item.subject, "ref": item.ref,
+                            "decision": decision, "rows": touched})
+    return {"settled": len(applied), "applied": applied}
+
+
+@app.get("/api/product")
+async def list_product(q: str | None = None, unlinked: bool = False,
+                       limit: int = 200):
+    """`nature` dit ce qu'un food_key vide VEUT DIRE : single = lacune, composite = normal."""
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, name, brand, food_key, nature, status, store
+                 FROM product
+                WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%')
+                  AND (NOT $2 OR food_key IS NULL)
+                ORDER BY id LIMIT $3""", q, unlinked, limit)
+    return {"count": len(rows), "products": [dict(r) for r in rows]}
+
+
+@app.patch("/api/product/{product_id}")
+async def patch_product(product_id: int, body: ProductPatch):
+    from cooking_manager.matching import clean_nature
+
+    try:
+        nature = clean_nature(body.nature, f"product/{product_id}")
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from None
+    if body.status is not None and body.status not in FOOD_STATUSES:
+        raise HTTPException(
+            422, f"status {body.status!r} inconnu, attendu parmi {list(FOOD_STATUSES)}")
+    pool = await get_pool(DATABASE_DSN)
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT * FROM product WHERE id = $1", product_id)
+        if existing is None:
+            raise HTTPException(404, f"Produit introuvable : {product_id}")
+        if body.food_key is not None:
+            await _food_or_404(conn, body.food_key)
+            if (nature or existing["nature"]) == "composite":
+                raise HTTPException(
+                    422, "un composite porte ses propres macros : il ne se rattache pas")
+        status = body.status
+        if body.food_key is not None and status is None:
+            status = "linked"
+        row = await conn.fetchrow(
+            """UPDATE product SET
+                   food_key = COALESCE($2, food_key),
+                   nature   = COALESCE($3, nature),
+                   status   = COALESCE($4, status),
+                   name     = COALESCE($5, name),
+                   brand    = COALESCE($6, brand)
+                WHERE id = $1
+            RETURNING id, name, brand, food_key, nature, status""",
+            product_id, body.food_key, nature, status, body.name, body.brand)
+    return dict(row)
+
+
+WEB_DIR = Path(__file__).parent.parent / "web"
+if WEB_DIR.is_dir():
+    @app.get("/")
+    async def index():
+        return FileResponse(WEB_DIR / "index.html")
+
+    app.mount("/", StaticFiles(directory=str(WEB_DIR)), name="static")

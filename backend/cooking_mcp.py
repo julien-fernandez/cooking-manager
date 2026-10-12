@@ -1,0 +1,350 @@
+"""Cooking Manager MCP server — pantry + cooking tools for LLMs."""
+
+import json
+import os
+
+from fastmcp import FastMCP
+
+mcp = FastMCP(
+    "Cooking Manager",
+    instructions=(
+        "Garde-manger, liste de courses, et recettes du foyer. "
+        "Le garde-manger est la source de vérité pour ce qu'on a en stock. "
+        "La liste de courses différentielle croise le menu de la semaine "
+        "avec le stock réel."
+    ),
+)
+
+API_BASE = os.environ.get(
+    "COOKING_MANAGER_API_BASE", "http://127.0.0.1:8795"
+)
+
+async def _api(method: str, path: str, body: dict | None = None) -> dict:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        if method == "GET":
+            r = await client.get(f"{API_BASE}{path}")
+        elif method == "POST":
+            r = await client.post(f"{API_BASE}{path}", json=body)
+        elif method == "PUT":
+            r = await client.put(f"{API_BASE}{path}", json=body)
+        elif method == "PATCH":
+            r = await client.patch(f"{API_BASE}{path}", json=body)
+        elif method == "DELETE":
+            r = await client.delete(f"{API_BASE}{path}", params=body)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        r.raise_for_status()
+        return r.json()
+
+@mcp.tool()
+async def pantry_list(section: str = "") -> str:
+    """List all pantry items, optionally filtered by section (rayon)."""
+    data = await _api("GET", "/api/pantry")
+    if section:
+        data["rayons"] = [
+            r for r in data["rayons"]
+            if section.lower() in r["name"].lower()
+        ]
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def pantry_search(query: str) -> str:
+    """Search pantry items by name (partial match, case insensitive)."""
+    data = await _api("GET", f"/api/pantry/search?q={query}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def pantry_add(
+    name: str,
+    section: str,
+    qty_text: str = "",
+    status: str = "ok",
+    notes: str = "",
+) -> str:
+    """Add a pantry item — `qty_text` must carry a quantity and a unit unless status is `out`."""
+    data = await _api("POST", "/api/pantry/items", {
+        "name": name,
+        "section": section,
+        "qty_text": qty_text,
+        "status": status,
+        "notes": notes or None,
+        "source": "voice",
+    })
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def pantry_update(
+    item_id: int,
+    qty_text: str = "",
+    status: str = "",
+    notes: str = "",
+) -> str:
+    """Update a pantry item — a status of `ok` or `low` is refused without a measurable quantity."""
+    body: dict = {}
+    if qty_text:
+        body["qty_text"] = qty_text
+    if status:
+        body["status"] = status
+    if notes:
+        body["notes"] = notes
+    data = await _api("PUT", f"/api/pantry/items/{item_id}", body)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def pantry_remove(item_id: int) -> str:
+    """Remove an item from the pantry by its ID."""
+    data = await _api("DELETE", f"/api/pantry/items/{item_id}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def shopping_list(menu_slug: str, covers: int | None = None) -> str:
+    """Differential shopping list for a menu. Without `covers`, each meal uses its real table."""
+    query = f"?covers={covers}" if covers else ""
+    data = await _api("GET", f"/api/menus/{menu_slug}/shopping-list{query}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def recipe_search(query: str = "", family: str = "", tag: str = "") -> str:
+    """Search recipes by name, family, or tag."""
+    params = []
+    if query:
+        params.append(f"q={query}")
+    if family:
+        params.append(f"family={family}")
+    if tag:
+        params.append(f"tag={tag}")
+    qs = "&".join(params) if params else ""
+    data = await _api("GET", f"/api/recipes?{qs}&limit=20")
+    recipes = [
+        {
+            "slug": r["slug"],
+            "title": r["title"],
+            "family": r.get("family"),
+            "servings": r.get("servings"),
+            "total_time_min": r.get("total_time_min"),
+            "macros": r.get("macros"),
+            "tags": r.get("tags", []),
+        }
+        for r in data.get("recipes", [])
+    ]
+    return json.dumps(
+        {"total": data["total"], "recipes": recipes},
+        ensure_ascii=False, indent=2,
+    )
+
+@mcp.tool()
+async def recipe_detail(slug: str) -> str:
+    """Get full recipe detail: ingredients, steps, macros."""
+    data = await _api("GET", f"/api/recipes/{slug}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def recipe_upsert(
+    title: str, body: str, slug: str = "", frontmatter_json: str = "{}"
+) -> str:
+    """Create or update a recipe in the DB (sole source of truth, ADR 0010 voie b).
+
+    body = markdown with '## Ingredients' and '## Etapes' sections (ingredients and
+    steps are re-parsed from it). frontmatter_json = JSON object of other fields:
+    family, servings, tags (list), macros ({kcal,protein,carbs,fat}), status,
+    sources (list), photo_url, recipe_type. Pass slug to update an existing recipe;
+    omit it to create (slug derived from the title)."""
+    fm = json.loads(frontmatter_json or "{}")
+    payload = {**fm, "title": title, "body": body}
+    if slug:
+        payload["slug"] = slug
+        data = await _api("PUT", f"/api/recipes/{slug}", payload)
+    else:
+        data = await _api("POST", "/api/recipes", payload)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def recipe_delete(slug: str) -> str:
+    """Delete a recipe from the DB by slug (also unlinks it from any menu meal)."""
+    data = await _api("DELETE", f"/api/recipes/{slug}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def menu_upsert(
+    title: str, meals_json: str, slug: str = "", week_start: str = "",
+    week_end: str = "", status: str = "proposed", configuration: str = "",
+    body: str = "",
+) -> str:
+    """Create or update a weekly menu in the DB (sole source of truth).
+
+    meals_json = JSON list of day objects, each with day/date and slot keys
+    (breakfast/lunch/snack/dinner), optional '<slot>_slug', '<slot>_leftovers',
+    and 'covers'. Meals are linked to recipes automatically. Pass slug to update."""
+    payload: dict = {
+        "title": title, "meals": json.loads(meals_json or "[]"), "status": status,
+    }
+    if slug:
+        payload["slug"] = slug
+    if week_start:
+        payload["week_start"] = week_start
+    if week_end:
+        payload["week_end"] = week_end
+    if configuration:
+        payload["configuration"] = configuration
+    if body:
+        payload["body"] = body
+    data = await _api("POST", "/api/menus", payload)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def menu_delete(slug: str) -> str:
+    """Delete a menu from the DB by slug."""
+    data = await _api("DELETE", f"/api/menus/{slug}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def menu_current() -> str:
+    """Get the most recent menu (current week)."""
+    data = await _api("GET", "/api/menus")
+    menus = data.get("menus", [])
+    if not menus:
+        return json.dumps({"error": "Aucun menu trouvé"}, ensure_ascii=False)
+    return json.dumps(menus[0], ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def relink_meals() -> str:
+    """Re-resolve menu-meal → recipe links. Vault ingestion removed (ADR 0022)."""
+    data = await _api("POST", "/api/ingest")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def people_list(circle: str = "") -> str:
+    """List people who can be at the table (household, family, friends, guests)."""
+    path = "/api/persons"
+    if circle:
+        path += f"?circle={circle}"
+    data = await _api("GET", path)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def person_add(
+    name: str,
+    circle: str = "occasional",
+    role: str = "adult",
+    diet: str = "omnivore",
+    dislikes: str = "",
+    forbidden: str = "",
+) -> str:
+    """Add a person (guest, family member) to the roster."""
+    body = {
+        "name": name, "circle": circle, "role": role, "diet": diet,
+        "dislikes": [t.strip() for t in dislikes.split(",") if t.strip()],
+        "forbidden": [t.strip() for t in forbidden.split(",") if t.strip()],
+    }
+    data = await _api("POST", "/api/persons", body)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def whos_eating(day: str, slot: str = "") -> str:
+    """Who eats on a given day — resolves the table from the DB."""
+    path = f"/api/attendance?day={day}"
+    if slot:
+        path += f"&slot={slot}"
+    data = await _api("GET", path)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def menu_compatibility(menu_slug: str) -> str:
+    """Dietary-compatibility check of a menu, meal by meal."""
+    data = await _api("GET", f"/api/menus/{menu_slug}/compatibility")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def stays_list() -> str:
+    """List holiday stays (periods away from home where the table changes)."""
+    data = await _api("GET", "/api/stays")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def stay_add(
+    label: str,
+    start_date: str,
+    end_date: str,
+    member_ids: str,
+    location: str = "",
+    cooking: bool = True,
+) -> str:
+    """Declare a holiday stay — fixes the "empty table on holidays" case (F.30)."""
+    body = {
+        "label": label, "start_date": start_date, "end_date": end_date,
+        "location": location or None, "cooking": cooking,
+        "member_ids": [int(x) for x in member_ids.split(",") if x.strip()],
+    }
+    data = await _api("POST", "/api/stays", body)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def absence_add(
+    person_id: int,
+    start_date: str,
+    end_date: str,
+    slot: str = "",
+    reason: str = "",
+) -> str:
+    """Declare that a person is away — removes them from the table."""
+    body = {
+        "person_id": person_id, "start_date": start_date, "end_date": end_date,
+        "slot": slot or None, "reason": reason or None,
+    }
+    data = await _api("POST", "/api/absences", body)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def household_seed() -> str:
+    """Seed/refresh the household roster and schedules in the DB (idempotent)."""
+    data = await _api("POST", "/api/seed")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def cart_lines(menu_slug: str) -> str:
+    """The app's cart for a menu: read counts.stale and counts.asked BEFORE lines; ids feed cart_set_quantity / cart_remove."""
+    from urllib.parse import quote
+
+    data = await _api("GET", f"/api/cart?menu_slug={quote(menu_slug)}")
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def cart_set_quantity(item_id: int, quantity: int, reason: str) -> str:
+    """Set a cart line's quantity (0 removes it). A pushed line changes at Drive A first and is re-read; reason is required."""
+    data = await _api("PATCH", f"/api/cart/items/{item_id}",
+                      {"quantity": quantity, "reason": reason})
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+async def cart_remove(item_id: int, reason: str) -> str:
+    """Remove a cart line: from Drive A if it was pushed, then marked skipped with its reason."""
+    data = await _api("DELETE", f"/api/cart/items/{item_id}", {"reason": reason})
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", default="stdio")
+    parser.add_argument("--http", type=int, help="HTTP port (implies streamable-http)")
+    parser.add_argument("--public-url", help="Public URL for OAuth redirects")
+    args = parser.parse_args()
+
+    if args.http:
+        import sys
+
+        sys.path.insert(0, "/srv/app/shared")
+        from mcp_auth import build_google_auth  # type: ignore[import-not-found]
+
+        public_url = args.public_url or f"http://127.0.0.1:{args.http}"
+        mcp.auth = build_google_auth("cooking", server_base_url=public_url)  # type: ignore[assignment]
+        mcp.run(
+            transport="streamable-http",
+            host="127.0.0.1",
+            port=args.http,
+            allowed_hosts=["cooking-mcp.example.org"],
+        )
+    else:
+        mcp.run(transport=args.transport)  # type: ignore[arg-type]

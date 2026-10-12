@@ -1,0 +1,2123 @@
+{
+  "version": "0.11.0",
+  "slug": "cooking-vocabulary",
+  "origin": "Extrait du moteur de substitutions porté de cooking-manager v1 (server/src/services/intelligentSubstitutions.ts) et mesuré en production dans cooking-manager-2 le 2026-09-02. Voir cooking-manager-2 ADR 0001.",
+  "cooking_methods": [
+    {
+      "key": "stew",
+      "label": "Mijoté",
+      "status": "active",
+      "definition": "Cuisson longue en milieu liquide, à couvert ou à feu doux.",
+      "synonyms": [
+        "mijoté",
+        "ragoût",
+        "cocotte",
+        "braisé",
+        "à feu doux",
+        "à petit feu",
+        "à couvert"
+      ],
+      "applicable_when": "",
+      "dominates": [
+        "pan-fried",
+        "pan-seared",
+        "stir-fry"
+      ],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "slow-cooked",
+      "label": "Cuisson lente",
+      "status": "active",
+      "definition": "Cuisson prolongée à basse température.",
+      "synonyms": [
+        "mijoté",
+        "slow-cooked",
+        "cuisson lente"
+      ],
+      "applicable_when": "",
+      "dominates": [
+        "pan-fried",
+        "pan-seared",
+        "stir-fry"
+      ],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "grilled",
+      "label": "Grillé",
+      "status": "active",
+      "definition": "Cuisson par contact direct avec une source de chaleur vive.",
+      "synonyms": [
+        "grillé",
+        "barbecue",
+        "plancha",
+        "grill"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "bbq",
+      "label": "Barbecue",
+      "status": "active",
+      "definition": "Grillade au feu de bois ou au charbon.",
+      "synonyms": [
+        "barbecue",
+        "bbq"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "pan-fried",
+      "label": "Poêlé",
+      "status": "active",
+      "definition": "Cuisson à la poêle avec un corps gras.",
+      "synonyms": [
+        "poêlé",
+        "sauté",
+        "à la poêle",
+        "dans une poêle",
+        "dans la poêle",
+        "faites dorer"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "pan-seared",
+      "label": "Saisi",
+      "status": "active",
+      "definition": "Saisie vive et courte, cœur peu cuit.",
+      "synonyms": [
+        "saisir",
+        "snacké",
+        "poêler"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "stir-fry",
+      "label": "Sauté au wok",
+      "status": "active",
+      "definition": "Sauté vif et remué, à feu très fort.",
+      "synonyms": [
+        "wok",
+        "sauté",
+        "stir-fry"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "oven",
+      "label": "Au four",
+      "status": "active",
+      "definition": "Cuisson au four, chaleur enveloppante.",
+      "synonyms": [
+        "au four",
+        "rôti"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "breaded",
+      "label": "Pané",
+      "status": "active",
+      "definition": "Enrobé de chapelure avant cuisson.",
+      "synonyms": [
+        "pané",
+        "chapelure",
+        "panko",
+        "katsu",
+        "tempura"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "steamed",
+      "label": "Vapeur",
+      "status": "active",
+      "definition": "Cuisson à la vapeur, sans contact avec le liquide.",
+      "synonyms": [
+        "vapeur",
+        "cuit à la vapeur"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "glazed",
+      "label": "Laqué",
+      "status": "active",
+      "definition": "Nappé d'une sauce réduite et sucrée en fin de cuisson.",
+      "synonyms": [
+        "laqué",
+        "glacé"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "smoked",
+      "label": "Fumé",
+      "status": "active",
+      "definition": "Aromatisé et conservé par la fumée.",
+      "synonyms": [
+        "fumé",
+        "au fumoir"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "raw",
+      "label": "Cru",
+      "status": "active",
+      "definition": "Servi sans cuisson, éventuellement mariné.",
+      "synonyms": [
+        "tartare",
+        "carpaccio",
+        "cru",
+        "mariné"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "cuisines": [
+    {
+      "key": "asian",
+      "label": "Asiatique",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "wok",
+        "soja",
+        "gingembre",
+        "curry vert",
+        "curry rouge",
+        "coco",
+        "citronnelle",
+        "nuoc-mam"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "thai",
+      "label": "Thaïlandaise",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "curry vert",
+        "curry rouge",
+        "citronnelle",
+        "coco",
+        "piment thai",
+        "basilic thai"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "chinese",
+      "label": "Chinoise",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "wok",
+        "soja",
+        "gingembre",
+        "cinq-épices",
+        "nouilles chinoises"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "vietnamese",
+      "label": "Vietnamienne",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "nuoc-mam",
+        "pho",
+        "banh",
+        "nem",
+        "citronnelle",
+        "menthe fraîche"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "japanese",
+      "label": "Japonaise",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "soja",
+        "mirin",
+        "saké",
+        "wasabi",
+        "teriyaki",
+        "katsu",
+        "tempura",
+        "panko",
+        "gomasio",
+        "japonais"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "indian",
+      "label": "Indienne",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "curry",
+        "tandoori",
+        "tikka",
+        "masala",
+        "garam masala",
+        "cumin",
+        "coriandre",
+        "cardamome"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "pakistani",
+      "label": "Pakistanaise",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "biryani",
+        "karahi",
+        "korma",
+        "garam masala",
+        "tandoori",
+        "ghee"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "mediterranean",
+      "label": "Méditerranéenne",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "olive",
+        "tomate",
+        "basilic",
+        "origan",
+        "citron",
+        "ail"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "greek",
+      "label": "Grecque",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "feta",
+        "tzatziki",
+        "kalamata",
+        "yaourt grec",
+        "origan",
+        "aneth"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "italian",
+      "label": "Italienne",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "tomate",
+        "basilic",
+        "parmesan",
+        "mozzarella",
+        "pesto"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "french",
+      "label": "Française",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "vin blanc",
+        "vin rouge",
+        "échalote",
+        "beurre",
+        "crème fraîche",
+        "moutarde"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "spanish",
+      "label": "Espagnole",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "chorizo",
+        "pimenton",
+        "paprika fumé",
+        "safran",
+        "piquillo",
+        "tapas"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "american",
+      "label": "Américaine",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "burger",
+        "cheddar",
+        "coleslaw",
+        "buffalo",
+        "cajun",
+        "bbq sauce"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "mexican",
+      "label": "Mexicaine",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "cumin",
+        "piment",
+        "avocat",
+        "coriandre",
+        "lime"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "middle_eastern",
+      "label": "Moyen-orientale",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "tahini",
+        "cumin",
+        "sumac",
+        "grenade",
+        "menthe"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "west_african",
+      "label": "Ouest-africaine",
+      "status": "active",
+      "definition": "",
+      "synonyms": [
+        "mafé",
+        "mafe",
+        "pâte d'arachide",
+        "huile d'arachide",
+        "yassa",
+        "thiéboudienne",
+        "sénégalais"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "textures": [
+    {
+      "key": "firm",
+      "label": "Ferme",
+      "status": "active",
+      "definition": "Tient à la cuisson, ne se délite pas.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "tender",
+      "label": "Tendre",
+      "status": "active",
+      "definition": "Chair moelleuse, cuisson courte.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "flaky",
+      "label": "Floconneux",
+      "status": "active",
+      "definition": "Se détache en lamelles, supporte la panure.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "crispy",
+      "label": "Croustillant",
+      "status": "active",
+      "definition": "Recherché pour le croquant après cuisson vive.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "accommodations": [
+    {
+      "key": "self_service",
+      "label": "Libre-service",
+      "status": "active",
+      "definition": "L'ingrédient litigieux est servi à part, chacun se sert ; le convive arbitre, pas la recette.",
+      "synonyms": [],
+      "applicable_when": "L'ingrédient est ajoutable après coup sans recuisson — crudité, condiment, garniture.",
+      "dominates": [],
+      "observed_in": [
+        "salade-vietnamienne",
+        "sandwiches-rillettes-thon",
+        "sandwiches-saumon-fume-saint-moret",
+        "tortilla-pizza-atelier"
+      ],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "full_substitution",
+      "label": "Substitution totale",
+      "status": "active",
+      "definition": "L'ingrédient est remplacé pour tout le monde ; le plat change.",
+      "synonyms": [],
+      "applicable_when": "L'ingrédient est fondu dans la préparation — haché, mariné, mijoté dans la base, réduit en sauce.",
+      "dominates": [],
+      "observed_in": [
+        "mafe-poisson-legumes",
+        "salade-lentilles-froides-graines-courge",
+        "tagliatelles-carbonara-vege"
+      ],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "separate_portion",
+      "label": "Part séparée",
+      "status": "probation",
+      "definition": "Le plat est cuisiné tel quel ; une part reçoit un ingrédient différent au service.",
+      "synonyms": [],
+      "applicable_when": "L'ingrédient est ajouté tard — posé sur le plat, saisi à part, incorporé au service.",
+      "dominates": [],
+      "observed_in": [
+        "mafe-poulet"
+      ],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "separate_dish",
+      "label": "Plat séparé",
+      "status": "probation",
+      "definition": "Un plat distinct est préparé pour le convive incompatible.",
+      "synonyms": [],
+      "applicable_when": "Ni la substitution ni la part séparée ne tiennent — le plat est indissociable de son ingrédient.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "appreciations": [
+    {
+      "key": "loved",
+      "label": "Adoré",
+      "status": "probation",
+      "definition": "En redemande, à remettre au menu sans hésiter.",
+      "synonyms": [
+        "adoré",
+        "excellent",
+        "top",
+        "délicieux",
+        "en redemande"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "liked",
+      "label": "Aimé",
+      "status": "probation",
+      "definition": "Mangé avec plaisir, sans enthousiasme particulier.",
+      "synonyms": [
+        "aimé",
+        "bien",
+        "bon",
+        "correct",
+        "sympa"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "mixed",
+      "label": "Mitigé",
+      "status": "probation",
+      "definition": "Mangé sans plaisir, ou apprécié seulement en partie.",
+      "synonyms": [
+        "moyen",
+        "mitigé",
+        "bof",
+        "sans plus",
+        "moyennement",
+        "moins aimé",
+        "moins bien",
+        "moins bon"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "disliked",
+      "label": "Pas aimé",
+      "status": "probation",
+      "definition": "Mangé à contrecœur, ou laissé en partie.",
+      "synonyms": [
+        "pas aimé",
+        "pas terrible",
+        "mauvais",
+        "pas fini"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "refused",
+      "label": "Refusé",
+      "status": "probation",
+      "definition": "N'a pas été mangé du tout.",
+      "synonyms": [
+        "refusé",
+        "pas touché",
+        "n'a pas mangé"
+      ],
+      "applicable_when": "Distinguer d'un interdit alimentaire : un refus se constate à table, une contrainte se déclare dans `person`.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "replay_verdicts": [
+    {
+      "key": "keep_as_is",
+      "label": "À refaire tel quel",
+      "status": "probation",
+      "definition": "Le plat rentre dans la rotation sans modification.",
+      "synonyms": [
+        "à refaire",
+        "à garder",
+        "tel quel",
+        "on garde"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "adjust",
+      "label": "À refaire en modifiant",
+      "status": "probation",
+      "definition": "Le plat vaut la peine, mais une correction est nécessaire — laquelle vit dans issue_kinds.",
+      "synonyms": [
+        "à ajuster",
+        "à modifier",
+        "à revoir",
+        "presque",
+        "à refaire en modifiant",
+        "à refaire mais",
+        "à refaire avec"
+      ],
+      "applicable_when": "Toujours accompagné d'au moins un issue_kinds, sinon la correction est perdue.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "situational",
+      "label": "À refaire pour une occasion précise",
+      "status": "probation",
+      "definition": "Le plat reste au répertoire mais ne se propose pas librement — il est lié à un contexte de service, pas à un défaut.",
+      "synonyms": [
+        "à réserver pour",
+        "seulement pour",
+        "seulement quand",
+        "à garder pour",
+        "uniquement pour",
+        "quand il faut finir"
+      ],
+      "applicable_when": "L'occasion vit dans le verbatim ; sans occasion nommée, le verdict n'est pas celui-là. Distinguer d'`adjust` : ici le plat n'a rien à corriger.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "retire",
+      "label": "À ne plus refaire",
+      "status": "probation",
+      "definition": "Le plat sort de la rotation.",
+      "synonyms": [
+        "à oublier",
+        "plus jamais",
+        "on arrête"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "issue_kinds": [
+    {
+      "key": "seasoning",
+      "label": "Assaisonnement",
+      "status": "probation",
+      "definition": "Trop ou pas assez : sel, épices, acidité, sucre.",
+      "synonyms": [
+        "fade",
+        "trop salé",
+        "trop épicé",
+        "trop piquant",
+        "manque de goût",
+        "trop acide"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "texture",
+      "label": "Texture",
+      "status": "probation",
+      "definition": "Consistance ratée indépendamment de la cuisson : pâteux, sec, filandreux, détrempé.",
+      "synonyms": [
+        "pâteux",
+        "sec",
+        "filandreux",
+        "détrempé",
+        "spongieux"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "doneness",
+      "label": "Cuisson",
+      "status": "probation",
+      "definition": "Trop cuit ou pas assez.",
+      "synonyms": [
+        "trop cuit",
+        "pas assez cuit",
+        "cramé",
+        "cru",
+        "brûlé"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "portion",
+      "label": "Quantité",
+      "status": "probation",
+      "definition": "Trop ou pas assez servi — vise le calcul de portions, pas le goût.",
+      "synonyms": [
+        "trop peu",
+        "pas assez",
+        "il en restait",
+        "on a eu faim"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "effort",
+      "label": "Effort disproportionné",
+      "status": "probation",
+      "definition": "Le temps ou la charge de préparation ne valait pas le résultat.",
+      "synonyms": [
+        "trop long",
+        "trop de vaisselle",
+        "pas rentable",
+        "prise de tête"
+      ],
+      "applicable_when": "Jugé par celui qui cuisine, pas par la tablée.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "product_natures": [
+    {
+      "key": "single",
+      "label": "Conditionnement d'un aliment",
+      "status": "active",
+      "definition": "Le produit est UN aliment mis en boite, en sachet ou en barquette. Ses macros sont celles de l'aliment, a la marque pres.",
+      "synonyms": [
+        "produit simple",
+        "aliment conditionne"
+      ],
+      "applicable_when": "Le nom designe un aliment que le referentiel porte ou devrait porter : feta, courgettes en rondelles, pignons de pin, flocons d'avoine.",
+      "dominates": [],
+      "observed_in": [
+        "Itineraire des Saveurs Feta Grecque AOP",
+        "Picard Courgettes en rondelles surgelees",
+        "Drive A Flocons d'Avoine"
+      ],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "composite",
+      "label": "Preparation a plusieurs ingredients",
+      "status": "active",
+      "definition": "Le produit combine plusieurs aliments. Aucun d'eux ne porte ses macros : elles lui sont propres.",
+      "synonyms": [
+        "plat cuisine",
+        "preparation",
+        "assaisonnement compose"
+      ],
+      "applicable_when": "Le nom designe un plat, une patisserie, un assaisonnement compose, un complement ou une boisson preparee.",
+      "dominates": [],
+      "observed_in": [
+        "Picard Lasagnes Legumes Grilles Mozzarella",
+        "pesto-genovese",
+        "Snickers hi-protein",
+        "Patak's Sauce Tikka Masala"
+      ],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "product_qualities": [
+    {
+      "key": "excellent",
+      "label": "Excellent",
+      "status": "probation",
+      "definition": "À racheter sans hésiter, meilleur que les alternatives connues.",
+      "synonyms": [
+        "excellent",
+        "top",
+        "hyper bon",
+        "parfait",
+        "le meilleur"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "good",
+      "label": "Bon",
+      "status": "probation",
+      "definition": "Satisfaisant, choix par défaut.",
+      "synonyms": [
+        "bon",
+        "bien",
+        "correct",
+        "ok"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "mediocre",
+      "label": "Médiocre",
+      "status": "probation",
+      "definition": "Mangeable mais décevant — chercher une alternative.",
+      "synonyms": [
+        "médiocre",
+        "bof",
+        "moyen",
+        "pas terrible",
+        "décevant"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "bad",
+      "label": "Mauvais",
+      "status": "probation",
+      "definition": "Ne pas racheter.",
+      "synonyms": [
+        "mauvais",
+        "nul",
+        "immangeable",
+        "dégueulasse",
+        "à jeter"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "product_aspects": [
+    {
+      "key": "freshness",
+      "label": "Fraîcheur",
+      "status": "probation",
+      "definition": "État de fraîcheur à réception ou ouverture.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "taste",
+      "label": "Goût",
+      "status": "probation",
+      "definition": "Saveur du produit tel quel.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "texture",
+      "label": "Texture",
+      "status": "probation",
+      "definition": "Consistance, tenue, fondant.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "value",
+      "label": "Rapport qualité/prix",
+      "status": "probation",
+      "definition": "Ce que le produit vaut pour son prix.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "packaging",
+      "label": "Conditionnement",
+      "status": "probation",
+      "definition": "Praticité, quantité, conservation de l'emballage.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "general",
+      "label": "Général",
+      "status": "probation",
+      "definition": "Jugement global sans aspect précis.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "purchase_channels": [
+    {
+      "key": "drive_a_drive",
+      "label": "Drive A Drive",
+      "status": "probation",
+      "definition": "Commande drive retirée en magasin Drive A.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "drive_b_drive",
+      "label": "Drive B Drive",
+      "status": "probation",
+      "definition": "Commande drive retirée en magasin Drive B.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "marche",
+      "label": "Marché",
+      "status": "probation",
+      "definition": "Achat sur un marché de plein vent.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "boucherie",
+      "label": "Boucherie",
+      "status": "probation",
+      "definition": "Achat chez un boucher.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "epicerie",
+      "label": "Épicerie",
+      "status": "probation",
+      "definition": "Achat en épicerie de quartier ou spécialisée.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "bio",
+      "label": "Magasin bio",
+      "status": "probation",
+      "definition": "Achat en magasin bio (Biocoop, Naturalia…).",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "autre",
+      "label": "Autre",
+      "status": "probation",
+      "definition": "Canal d'achat non listé.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "cooking_tip_kinds": [
+    {
+      "key": "timing",
+      "label": "Temps",
+      "status": "probation",
+      "definition": "Ajuster durée de cuisson, repos, marinade.",
+      "synonyms": [
+        "cuire moins",
+        "cuire plus",
+        "laisser reposer",
+        "5 min de moins"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "ingredient_tweak",
+      "label": "Ajustement ingrédient",
+      "status": "probation",
+      "definition": "Changer quantité, forme ou ajouter un ingrédient.",
+      "synonyms": [
+        "ajouter",
+        "mettre moins de",
+        "mettre plus de",
+        "rajouter du citron"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "technique",
+      "label": "Technique",
+      "status": "probation",
+      "definition": "Geste ou méthode à changer.",
+      "synonyms": [
+        "à la poêle plutôt",
+        "au four plutôt",
+        "couper plus fin",
+        "mixer"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "equipment",
+      "label": "Matériel",
+      "status": "probation",
+      "definition": "Ustensile ou contenant qui change le résultat.",
+      "synonyms": [
+        "cocotte",
+        "plaque",
+        "moule",
+        "thermomètre"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "substitution_outcomes": [
+    {
+      "key": "success",
+      "label": "Réussi",
+      "status": "probation",
+      "definition": "Le remplacement marche, à proposer par défaut.",
+      "synonyms": [
+        "les enfants ont préféré",
+        "mieux",
+        "ça marche bien"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "acceptable",
+      "label": "Acceptable",
+      "status": "probation",
+      "definition": "Dépannage OK, pas un upgrade.",
+      "synonyms": [
+        "ça passe",
+        "en dépannage",
+        "faute de mieux"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "failure",
+      "label": "Raté",
+      "status": "probation",
+      "definition": "Ne pas reproposer.",
+      "synonyms": [
+        "raté",
+        "pas bon",
+        "ça ne marche pas",
+        "ne pas refaire"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "service_contexts": [
+    {
+      "key": "batch_cooking",
+      "label": "Batch cooking",
+      "status": "probation",
+      "definition": "Se prépare à l'avance en quantité.",
+      "synonyms": [
+        "en batch",
+        "à préparer en avance",
+        "meal prep"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "next_day",
+      "label": "Préparé la veille",
+      "status": "probation",
+      "definition": "Supporte d'être réchauffé le lendemain.",
+      "synonyms": [
+        "la veille",
+        "réchauffé",
+        "le lendemain",
+        "se réchauffe bien"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "picnic",
+      "label": "Pique-nique",
+      "status": "probation",
+      "definition": "Se transporte et se mange froid.",
+      "synonyms": [
+        "pique-nique",
+        "à emporter",
+        "froid",
+        "lunch box"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "quick_meal",
+      "label": "Repas rapide",
+      "status": "probation",
+      "definition": "Préparation inférieure à 20 minutes.",
+      "synonyms": [
+        "rapide",
+        "vite fait",
+        "express",
+        "quand on a pas le temps"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "leftovers_base",
+      "label": "Base de restes",
+      "status": "probation",
+      "definition": "Se transforme bien en un autre plat le lendemain.",
+      "synonyms": [
+        "base de restes",
+        "ça se transforme",
+        "on peut en refaire"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "guests",
+      "label": "Invités",
+      "status": "probation",
+      "definition": "Assez présentable pour recevoir.",
+      "synonyms": [
+        "invités",
+        "quand on reçoit",
+        "pour les amis"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "kids_only",
+      "label": "Enfants seuls",
+      "status": "probation",
+      "definition": "Quand les adultes ne mangent pas avec.",
+      "synonyms": [
+        "enfants seuls",
+        "les soirs sans nous"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "brunch",
+      "label": "Brunch",
+      "status": "probation",
+      "definition": "Format brunch du weekend.",
+      "synonyms": [
+        "brunch",
+        "dimanche matin",
+        "grasse matinée"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "effort_bands": [
+    {
+      "key": "hands_off",
+      "label": "Les mains libres",
+      "status": "probation",
+      "definition": "La cuisson travaille seule — four, mijotage à couvert. On pose et on part.",
+      "synonyms": [
+        "au four",
+        "à couvert",
+        "laisser mijoter",
+        "enfourner",
+        "laisser cuire",
+        "oublier au four"
+      ],
+      "applicable_when": "Aucune étape ne demande une présence continue, et la cuisson longue est passive.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "light_hands_on",
+      "label": "Quelques gestes",
+      "status": "probation",
+      "definition": "Une poêlée, une salade composée, un assemblage : des gestes courts, pas de surveillance.",
+      "synonyms": [
+        "mélanger",
+        "assembler",
+        "arroser",
+        "égoutter",
+        "couper",
+        "émincer"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "hands_on",
+      "label": "Devant la casserole",
+      "status": "probation",
+      "definition": "Présence continue exigée : on ne peut pas quitter la cuisine.",
+      "synonyms": [
+        "remuer sans cesse",
+        "sans cesser de remuer",
+        "louche par louche",
+        "surveiller",
+        "ne pas quitter",
+        "en remuant constamment"
+      ],
+      "applicable_when": "Une étape impose de remuer sans arrêt, de surveiller, ou de mener plusieurs feux de front.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "project",
+      "label": "Plat de week-end",
+      "status": "probation",
+      "definition": "Façonnage, montage ou repos : le plat se construit en plusieurs temps.",
+      "synonyms": [
+        "façonner",
+        "former des boulettes",
+        "farcir",
+        "monter",
+        "laisser reposer",
+        "pétrir",
+        "abaisser",
+        "rouler"
+      ],
+      "applicable_when": "Le plat demande de façonner, farcir, monter, ou de respecter un repos entre deux étapes.",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "food_kinds": [
+    {
+      "key": "butter",
+      "label": "Beurre",
+      "status": "active",
+      "definition": "Matière grasse laitière.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "biscuit",
+      "label": "Biscuit",
+      "status": "active",
+      "definition": "Produit sucré sec de l'épicerie.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "grain",
+      "label": "Céréale",
+      "status": "active",
+      "definition": "Céréale dont le degré de raffinage n'a pas été tranché.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [
+        "whole-grain",
+        "refined-grain"
+      ],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "cured-meat",
+      "label": "Charcuterie",
+      "status": "active",
+      "definition": "Viande salée, fumée ou séchée.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "flour",
+      "label": "Farine",
+      "status": "active",
+      "definition": "Céréale ou légumineuse moulue.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "cheese",
+      "label": "Fromage",
+      "status": "active",
+      "definition": "Laitage affiné ou frais vendu comme fromage.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "dairy",
+      "label": "Laitage",
+      "status": "active",
+      "definition": "Lait et produits laitiers hors fromage.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "legume",
+      "label": "Légumineuse",
+      "status": "active",
+      "definition": "Lentille, pois chiche, haricot, fève.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "nut",
+      "label": "Oléagineux",
+      "status": "active",
+      "definition": "Fruit à coque et graine oléagineuse.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "bread",
+      "label": "Pain",
+      "status": "active",
+      "definition": "Pain et panification.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "breading",
+      "label": "Panure",
+      "status": "active",
+      "definition": "Chapelure et enrobage de friture.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "fish",
+      "label": "Poisson",
+      "status": "active",
+      "definition": "Poisson dont la teneur en lipides n'a pas été tranchée.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [
+        "oily-fish",
+        "lean-fish"
+      ],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "vegetable",
+      "label": "Légume",
+      "status": "probation",
+      "definition": "Légume frais, surgelé ou en conserve.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "fruit",
+      "label": "Fruit",
+      "status": "probation",
+      "definition": "Fruit frais entier, hors jus.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "whole-grain",
+      "label": "Céréale complète",
+      "status": "probation",
+      "definition": "Céréale dont le son et le germe sont conservés.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "refined-grain",
+      "label": "Céréale raffinée",
+      "status": "probation",
+      "definition": "Céréale blutée, son et germe retirés.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "oily-fish",
+      "label": "Poisson gras",
+      "status": "probation",
+      "definition": "Poisson riche en oméga-3 : sardine, maquereau, saumon, hareng, truite.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "lean-fish",
+      "label": "Poisson maigre",
+      "status": "probation",
+      "definition": "Poisson pauvre en lipides : cabillaud, lieu, merlan, sole.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "olive-oil",
+      "label": "Huile d'olive",
+      "status": "probation",
+      "definition": "Huile d'olive, vierge ou raffinée.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "other-oil",
+      "label": "Autre huile",
+      "status": "probation",
+      "definition": "Huile végétale qui n'est pas d'olive.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "food_cuts": [
+    {
+      "key": "fillet",
+      "label": "Filet",
+      "status": "active",
+      "definition": "Muscle levé entier, sans os.",
+      "synonyms": [
+        "filets",
+        "escalope",
+        "escalopes",
+        "aiguillette",
+        "aiguillettes"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "thigh",
+      "label": "Cuisse",
+      "status": "active",
+      "definition": "Membre postérieur entier ou sa partie haute.",
+      "synonyms": [
+        "cuisses",
+        "haut de cuisse",
+        "hauts de cuisse"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "drumstick",
+      "label": "Pilon",
+      "status": "active",
+      "definition": "Bas de cuisse de volaille, avec son os.",
+      "synonyms": [
+        "pilons"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "wing",
+      "label": "Aile",
+      "status": "active",
+      "definition": "Membre antérieur de volaille.",
+      "synonyms": [
+        "ailes",
+        "manchon",
+        "manchons"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "roast",
+      "label": "Rôti",
+      "status": "active",
+      "definition": "Pièce ficelée destinée au four.",
+      "synonyms": [
+        "rotis"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "diced",
+      "label": "Cube",
+      "status": "active",
+      "definition": "Chair détaillée en dés.",
+      "synonyms": [
+        "cubes",
+        "morceau",
+        "morceaux",
+        "émincé",
+        "émincés"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    },
+    {
+      "key": "slice",
+      "label": "Tranche",
+      "status": "active",
+      "definition": "Chair coupée en tranches.",
+      "synonyms": [
+        "tranches"
+      ],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "",
+      "satisfied_by": []
+    }
+  ],
+  "mediterranean_criteria": [
+    {
+      "key": "vegetables",
+      "label": "Légumes",
+      "status": "probation",
+      "definition": "Au moins 3 portions par jour, dont une crue.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "1",
+      "satisfied_by": [
+        "vegetable"
+      ]
+    },
+    {
+      "key": "fruits",
+      "label": "Fruits",
+      "status": "probation",
+      "definition": "Au moins 2 portions par jour, entiers, jamais en jus.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "2",
+      "satisfied_by": [
+        "fruit"
+      ]
+    },
+    {
+      "key": "legumes",
+      "label": "Légumineuses",
+      "status": "probation",
+      "definition": "Au moins une portion par jour.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "3",
+      "satisfied_by": [
+        "legume"
+      ]
+    },
+    {
+      "key": "whole-grains",
+      "label": "Céréales complètes",
+      "status": "probation",
+      "definition": "Au moins une portion par jour, hors riz.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "4",
+      "satisfied_by": [
+        "whole-grain"
+      ]
+    },
+    {
+      "key": "oily-fish",
+      "label": "Poisson gras",
+      "status": "probation",
+      "definition": "Au moins deux fois par semaine.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "5",
+      "satisfied_by": [
+        "oily-fish"
+      ]
+    },
+    {
+      "key": "olive-oil",
+      "label": "Huile d'olive",
+      "status": "probation",
+      "definition": "Au moins une cuillère à soupe par jour, extra-vierge de préférence.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "6",
+      "satisfied_by": [
+        "olive-oil"
+      ]
+    },
+    {
+      "key": "dairy",
+      "label": "Produits laitiers",
+      "status": "probation",
+      "definition": "Au moins une portion par jour, jamais 0 % de matière grasse.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "7",
+      "satisfied_by": [
+        "dairy",
+        "cheese"
+      ]
+    },
+    {
+      "key": "nuts",
+      "label": "Fruits secs et noix",
+      "status": "probation",
+      "definition": "Environ une poignée par jour.",
+      "synonyms": [],
+      "applicable_when": "",
+      "dominates": [],
+      "observed_in": [],
+      "code": "8",
+      "satisfied_by": [
+        "nut"
+      ]
+    },
+    {
+      "key": "water-and-tea",
+      "label": "Eau et thé vert",
+      "status": "probation",
+      "definition": "Six à huit verres d'eau et au moins une infusion par jour.",
+      "synonyms": [],
+      "applicable_when": "Hors de portée : aucun ingrédient de recette ne porte la boisson d'une journée. Se lit HORS DE PORTÉE, jamais « non tenu ».",
+      "dominates": [],
+      "observed_in": [],
+      "code": "9",
+      "satisfied_by": []
+    }
+  ],
+  "_scope": {
+    "food_cuts": {
+      "applies_to": "Le mot de TÊTE d'un libellé commercial qui nomme une part ou une mise en forme d'un aliment, sans changer son identité — « Cuisses de poulet blanc » reste du poulet.",
+      "does_not_apply_to": [
+        "préparation composée dont l'aliment n'est qu'un ingrédient (« bouillon de poulet », « nuggets », « terrine ») — c'est un autre aliment, jamais une découpe",
+        "qualificatif commercial ou d'élevage (« extra tendre », « fermier », « label rouge ») — il ne dit rien de la part",
+        "état de conservation (« surgelé », « sèches », « fraîche ») — il change l'identité de l'aliment (voir `normalize_name`)",
+        "le libellé où la découpe EST l'aliment du référentiel (`filet de cabillaud`) — la comparaison directe suffit, rien à retirer"
+      ],
+      "absence_means": "PAS INSTRUIT — un libellé dont la tête n'est pas listée reste une QUESTION (`status: asked`), jamais une élection d'office.",
+      "known_tensions": [
+        "« blanc » est écarté volontairement : il est tour à tour découpe (blanc de poulet), robe (poulet blanc) et part d'œuf (blanc d'œuf). L'ajouter ferait passer « blancs d'œufs » pour des œufs.",
+        "`diced` recouvre le dé et l'émincé : deux mises en forme distinctes, indiscernables pour l'identité de l'aliment. À scinder si une quantité en dépend."
+      ]
+    },
+    "appreciations": {
+      "applies_to": "Un plat cuisiné à la maison et servi à une tablée identifiée.",
+      "does_not_apply_to": [
+        "repas hors domicile (ex. « Restaurant en ville » au menu 2026-09-01) — personne n'a cuisiné, il n'y a rien à rejouer",
+        "restes (`<slot>_leftovers: true`) — le jugement porte sur le plat d'origine, le noter deux fois le compterait deux fois",
+        "remplissages macro sans préparation (« Fromage blanc + whey », « Compote + graines de courge ») — la question « c'était bon ? » n'y a pas de sens décisionnel"
+      ],
+      "absence_means": "PAS INSTRUIT ou HORS PÉRIMÈTRE — jamais « personne n'a aimé ». Ne pas combler par défaut.",
+      "known_tensions": [
+        "`mixed` recouvre deux natures : « bon mais pas terrible » et « une partie du plat oui, une autre non ». Scinder si la distinction devient décisive.",
+        "`effort` est un défaut ressenti par le cuisinier, pas par la tablée — seul axe où l'avis de celui qui cuisine prime."
+      ]
+    },
+    "product_qualities": {
+      "applies_to": "Un produit spécifique acheté et cuisiné — rattaché à un `shopping_product` (drive/ticket) ou au référentiel `marques/`.",
+      "does_not_apply_to": [
+        "aliments génériques sans marque ni source identifiable — le jugement porte sur un produit concret, pas sur une catégorie",
+        "plats cuisinés à la maison — c'est `appreciations` qui les couvre"
+      ],
+      "absence_means": "PAS INSTRUIT — aucun retour qualité n'a été donné sur ce produit. Ne pas combler par défaut.",
+      "known_tensions": [
+        "Un retour peut porter sur le canal (marché vs drive) plutôt que sur le produit lui-même. Le `channel` + `aspect` désambiguent."
+      ]
+    },
+    "cooking_tip_kinds": {
+      "applies_to": "Une recette cuisinée au moins une fois — le tip vient de l'expérience, pas de la lecture.",
+      "does_not_apply_to": [
+        "recettes jamais cuisinées — c'est de la planification, pas un retour"
+      ],
+      "absence_means": "PAS INSTRUIT — aucun tip n'a été donné. Ne pas combler.",
+      "known_tensions": [
+        "`ingredient_tweak` chevauche une substitution : l'un modifie une quantité/forme, l'autre remplace un ingrédient entier."
+      ]
+    },
+    "substitution_outcomes": {
+      "applies_to": "Un remplacement d'ingrédient effectivement testé à table dans une recette identifiée.",
+      "does_not_apply_to": [
+        "substitutions théoriques de `substitutions.py` non testées — elles sont des suggestions, pas des retours"
+      ],
+      "absence_means": "PAS INSTRUIT — la substitution n'a pas été évaluée.",
+      "known_tensions": [
+        "Un substitut `success` dans un contexte (enfants) peut être `failure` dans un autre (adultes). Le champ `who_preferred` désambigue."
+      ]
+    },
+    "effort_bands": {
+      "applies_to": "Tout plat dont les ÉTAPES sont écrites — la bande est dérivée du texte, comme `has_anchored_stew`.",
+      "does_not_apply_to": [
+        "un repas `leftovers`, qui n'a pas de fiche donc pas d'étapes",
+        "un plat dont les étapes ne décrivent aucun geste (fiche squelette)"
+      ],
+      "absence_means": "PAS DÉRIVABLE — les étapes manquent. Jamais « plat facile » : c'est le défaut le plus coûteux, il ferait passer toute recette non instruite pour un plat de semaine.",
+      "known_tensions": [
+        "L'horloge et l'effort divergent : un mijoté de 50 min est `hands_off`, un risotto de 35 min est `hands_on`. Un plafond sur `total_time_min` classerait les deux à l'envers.",
+        "La bande est DÉRIVÉE, donc `probation` par construction. Elle ne passe `active` que confirmée au service, dans `service_context` — un plat qu'on a réellement tenu un mardi soir.",
+        "`issue_kinds/effort` note un effort DISPROPORTIONNÉ après coup (ça n'en valait pas la peine). `effort_bands` mesure la charge avant de cuisiner. Les deux peuvent diverger : un plat `light_hands_on` peut être jugé non rentable."
+      ]
+    },
+    "service_contexts": {
+      "applies_to": "Un plat dont le contexte de service a été identifié par l'expérience (pas par lecture de la recette).",
+      "does_not_apply_to": [
+        "plats jamais cuisinés"
+      ],
+      "absence_means": "PAS INSTRUIT — le plat n'a pas de contexte de service déclaré. Ne signifie pas « universel ».",
+      "known_tensions": [
+        "Un plat peut avoir plusieurs contextes (`batch_cooking` + `next_day`). Les valeurs ne s'excluent pas."
+      ]
+    },
+    "product_natures": {
+      "applies_to": "Tout produit du référentiel `marques/` — la question « ses macros sont-elles celles d'un aliment ? » a toujours une réponse.",
+      "does_not_apply_to": [],
+      "absence_means": "PAS INSTRUIT — le produit n'a pas encore été classé. Jamais « il n'a pas d'aliment parent » : c'est ce que dit `composite`, et lui seul.",
+      "known_tensions": [
+        "Un mélange nature (« Fruits Rouges surgelés », « Trio de Poivrons », « Mélange de Légumes Verts ») porte plusieurs aliments sans transformation. Classé `single` parce que le référentiel porte déjà des aliments-mélanges (`fruit rouge melange`, `legume du soleil`) — mais c'est un choix, pas une évidence. Scinder si la distinction devient décisive.",
+        "`food` contient déjà des préparations promues au rang d'aliment (`soupe pois casse industrielle`, `vinaigrette classique`, `sauce teriyaki`, `flan patissier`). La frontière single/composite traverse donc aussi le référentiel aliment, où rien ne la déclare.",
+        "Un assaisonnement composé (pesto, pâte de curry, vinaigrette) est `composite` par construction, alors qu'on ne le mange pas comme un plat. La valeur dit « pas d'aliment parent », pas « c'est un plat »."
+      ]
+    },
+    "food_kinds": {
+      "applies_to": "Tout aliment du référentiel `food` — la famille culinaire dont il relève.",
+      "does_not_apply_to": [
+        "un `product` : il porte une marque et un conditionnement, sa famille est celle de son `food_key`",
+        "une ligne d'ingrédient de recette : elle nomme un aliment, elle n'en est pas un"
+      ],
+      "absence_means": "PAS INSTRUIT — l'aliment n'a pas été classé. Jamais « ne relève d'aucune famille ». Mesuré le 2026-09-23 : 177 aliments sur 192 sans `kind`, donc l'absence est l'état DOMINANT du référentiel.",
+      "known_tensions": [
+        "`food.category` (rayon de courses) et `food.kind` (famille culinaire) se recouvrent sans se confondre : `feculents-legumineuses` réunit ce que `legume` et `whole-grain` séparent. C'est cette confusion qui rendait les critères 3 et 4 indérivables (ADR 0033).",
+        "Les douze clés `active` sont celles RÉELLEMENT écrites en base au 2026-09-23, renommées en anglais dans la même migration. Les huit autres viennent de la note de cadrage du 2026-05-22 et n'ont encore qualifié aucun aliment — d'où leur `probation`.",
+        "`grain` et ses deux raffinements (`whole-grain`, `refined-grain`) coexistent : les trois aliments déjà classés `grain` n'ont pas été rejugés. Un aliment resté `grain` ne satisfait AUCUN critère — ce n'est pas un défaut de l'axe, c'est une qualification qui manque."
+      ]
+    },
+    "mediterranean_criteria": {
+      "applies_to": "Une journée ou une semaine de menu dont les ingrédients sont rattachés à un aliment (`recipe_ingredient.food_key`).",
+      "does_not_apply_to": [
+        "un repas `leftovers` : il n'a pas de fiche, donc aucun ingrédient à confronter (#76)",
+        "un repas hors domicile : personne n'a choisi les ingrédients",
+        "les autres convives — le cadre vise le seul profil de Julien (note du 2026-05-22)"
+      ],
+      "absence_means": "PAS MESURABLE — aucun ingrédient rattaché. Jamais « critère non tenu » : mesuré le 2026-09-23, le rattachement vaut 0 ligne sur 1169, donc un score dérivé aujourd'hui vaudrait zéro partout sans rien dire.",
+      "known_tensions": [
+        "Le critère 9 (eau + thé vert) ne déclare aucun `food_kind` : rien dans une recette ne porte l'eau bue dans la journée. Il se lit HORS DE PORTÉE, jamais « non tenu » — sinon il fait baisser un score qu'aucun geste ne peut relever.",
+        "Les seuils du cadre (« ≥ 3 portions », « ≥ 1 c. à soupe ») ne sont pas portés ici : une portion n'est pas dérivable de la base tant que `person` n'a pas de profil nutritionnel (#78). L'axe dit QUELS aliments comptent, pas COMBIEN il en faut.",
+        "`recipe.mediterranean_criteria` (`INTEGER[]`) porte trois annotations manuelles antérieures. `code` en donne la lecture, mais la dérivation ne les consomme pas : elles témoignent d'un geste abandonné."
+      ]
+    }
+  }
+}

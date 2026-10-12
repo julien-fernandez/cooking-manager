@@ -1,0 +1,1162 @@
+"""PostgreSQL connection pool and schema management."""
+
+import asyncpg
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS recipe (
+    id          SERIAL PRIMARY KEY,
+    slug        TEXT UNIQUE NOT NULL,
+    title       TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'draft',
+    recipe_type TEXT,
+    family      TEXT,
+    servings    INTEGER,
+    total_time_min INTEGER,
+    prep_time_min  INTEGER,
+    cook_time_min  INTEGER,
+    tags        TEXT[] DEFAULT '{}',
+    compatible_constraints TEXT[] DEFAULT '{}',
+    sources     TEXT[] DEFAULT '{}',
+    appreciated_by TEXT[] DEFAULT '{}',
+    applied_substitutions TEXT[] DEFAULT '{}',
+    mediterranean_criteria INTEGER[] DEFAULT '{}',
+    construction_regime TEXT,
+    execution_count INTEGER DEFAULT 0,
+    lieu_execution TEXT,
+    macros_kcal   NUMERIC,
+    macros_protein NUMERIC,
+    macros_carbs  NUMERIC,
+    macros_fat    NUMERIC,
+    protein_density NUMERIC,
+    photo_url   TEXT,
+    sub_recipes TEXT[] DEFAULT '{}',
+    body        TEXT,
+    created     DATE,
+    updated     DATE,
+    ingested_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS recipe_ingredient (
+    id          SERIAL PRIMARY KEY,
+    recipe_id   INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    raw         TEXT NOT NULL,
+    qty_min     NUMERIC,
+    qty_max     NUMERIC,
+    unit        TEXT,
+    name        TEXT NOT NULL,
+    name_normalized TEXT NOT NULL DEFAULT '',
+    food_key    TEXT,
+    is_optional BOOL NOT NULL DEFAULT FALSE,
+    parsed      BOOL NOT NULL DEFAULT FALSE,
+    for_person_id     INTEGER,
+    replaces_position INTEGER,
+    UNIQUE (recipe_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_step (
+    id          SERIAL PRIMARY KEY,
+    recipe_id   INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    UNIQUE (recipe_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS recipe_execution (
+    id          SERIAL PRIMARY KEY,
+    recipe_id   INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    date        DATE NOT NULL,
+    cooked_by   TEXT,
+    rating      INTEGER CHECK (rating >= 1 AND rating <= 5),
+    appreciated_by TEXT[] DEFAULT '{}',
+    appreciation_date DATE,
+    notes       TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Brouillon d'import : une page de livre lue, PAS ENCORE validée. La capture se
+-- fait debout, la relecture assis et plus tard ; sans persistance, l'import
+-- n'aboutit que si les deux gestes tiennent dans la même minute.
+CREATE TABLE IF NOT EXISTS import_draft (
+    id          SERIAL PRIMARY KEY,
+    slug        TEXT,
+    title       TEXT,
+    source      TEXT,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'committed', 'discarded')),
+    draft       JSONB NOT NULL,
+    page_count  INTEGER DEFAULT 0,
+    committed_path TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_recipe_slug ON recipe(slug);
+CREATE INDEX IF NOT EXISTS idx_recipe_status ON recipe(status);
+CREATE INDEX IF NOT EXISTS idx_recipe_family ON recipe(family);
+CREATE INDEX IF NOT EXISTS idx_recipe_tags ON recipe USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_execution_recipe ON recipe_execution(recipe_id);
+CREATE INDEX IF NOT EXISTS idx_execution_date ON recipe_execution(date DESC);
+CREATE INDEX IF NOT EXISTS idx_ingredient_recipe ON recipe_ingredient(recipe_id);
+CREATE INDEX IF NOT EXISTS idx_ingredient_norm ON recipe_ingredient(name_normalized);
+CREATE INDEX IF NOT EXISTS idx_step_recipe ON recipe_step(recipe_id);
+CREATE INDEX IF NOT EXISTS idx_import_draft_status ON import_draft(status);
+
+CREATE TABLE IF NOT EXISTS menu (
+    id          SERIAL PRIMARY KEY,
+    slug        TEXT UNIQUE NOT NULL,
+    title       TEXT NOT NULL,
+    week_start  DATE,
+    week_end    DATE,
+    configuration TEXT,
+    pattern_sport TEXT,
+    status      TEXT NOT NULL DEFAULT 'proposed',
+    linked_recipes TEXT[] DEFAULT '{}',
+    meals       JSONB,
+    body        TEXT,
+    created     DATE,
+    updated     DATE,
+    ingested_at TIMESTAMPTZ DEFAULT NOW(),
+    meals_changed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Un repas = une ligne. C'est ce qui relie enfin le menu aux recettes, et ce
+-- qui permet de filtrer les recettes par semaine.
+--
+-- ⚠️ La clé est (menu, jour, créneau), PAS (menu, recette) : une recette
+-- refaite trois fois dans la semaine produit trois lignes. Dédoublonner sur la
+-- recette perdrait deux repas — et les quantités qui vont avec.
+--
+-- `recipe_id` est NULLABLE **par conception** : un repas sans fiche
+-- (« restes », « sandwich au marché ») reste un repas. Le forcer à pointer une
+-- recette obligerait à inventer un rattachement — et acheter les ingrédients
+-- de la mauvaise recette.
+CREATE TABLE IF NOT EXISTS menu_meal (
+    id          SERIAL PRIMARY KEY,
+    menu_id     INTEGER NOT NULL REFERENCES menu(id) ON DELETE CASCADE,
+    day         DATE,
+    day_label   TEXT,
+    position    INTEGER NOT NULL DEFAULT 0,
+    slot        TEXT NOT NULL,
+    dish        TEXT NOT NULL,
+    recipe_id   INTEGER REFERENCES recipe(id) ON DELETE SET NULL,
+    match_kind  TEXT,
+    covers      INTEGER,
+    served      BOOLEAN,
+    leftovers_of INTEGER REFERENCES menu_meal(id) ON DELETE SET NULL,
+    UNIQUE (menu_id, position, slot)
+);
+
+CREATE INDEX IF NOT EXISTS menu_meal_recipe_idx ON menu_meal(recipe_id);
+
+CREATE TABLE IF NOT EXISTS convive (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT UNIQUE NOT NULL,
+    constraints TEXT[] DEFAULT '{}',
+    notes       TEXT,
+    ingested_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS shopping_session (
+    id          SERIAL PRIMARY KEY,
+    date        DATE NOT NULL,
+    store       TEXT NOT NULL,
+    cart_id     TEXT,
+    covers      INTEGER,
+    people      TEXT[] DEFAULT '{}',
+    total       REAL,
+    items_count INTEGER,
+    notes       TEXT,
+    status      TEXT NOT NULL DEFAULT 'cart'
+                CHECK (status IN ('cart', 'ordered', 'abandoned')),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS shopping_product (
+    id              SERIAL PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES shopping_session(id) ON DELETE CASCADE,
+    item_requested  TEXT NOT NULL,
+    product_name    TEXT NOT NULL,
+    brand           TEXT,
+    product_id      TEXT,
+    price_unit      REAL,
+    quantity_bought  INTEGER DEFAULT 1,
+    total_price     REAL,
+    status          TEXT DEFAULT 'added',
+    rationale       TEXT NOT NULL,
+    quantity_rationale TEXT,
+    alternatives    JSONB DEFAULT '[]',
+    lesson_learned  TEXT,
+    drive_a_id       TEXT,
+    nutriscore      TEXT,
+    nutrition       JSONB,
+    ingredients     TEXT,
+    allergens       TEXT,
+    characteristics JSONB,
+    photo_url       TEXT,
+    product_url     TEXT,
+    weight          TEXT,
+    price_per_kg    REAL,
+    ean             TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS shopping_preference (
+    id          SERIAL PRIMARY KEY,
+    pref_type   TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    reason      TEXT,
+    active      BOOLEAN DEFAULT TRUE,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(pref_type, key)
+);
+
+-- cart_item : le panier dont l'application est propriétaire (#156). Une ligne y
+-- entre AVANT de partir vers le drive, avec son origine et son motif ; `pushed`
+-- ne s'écrit qu'après relecture du panier Drive A. `status = 'asked'` porte une
+-- ligne que l'élection a refusé de trancher seule — sa question vit dans `reason`.
+CREATE TABLE IF NOT EXISTS cart_item (
+    id           SERIAL PRIMARY KEY,
+    menu_slug    TEXT NOT NULL,
+    requested    TEXT NOT NULL,
+    food_key     TEXT,
+    product_name TEXT,
+    drive_a_id    TEXT,
+    product_id   TEXT,
+    offer_id     TEXT,
+    seller_id    TEXT,
+    quantity     INTEGER NOT NULL DEFAULT 1,
+    origin       TEXT NOT NULL
+                 CHECK (origin IN ('menu', 'manual', 'recurrent', 'substitution')),
+    reason       TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'elected'
+                 CHECK (status IN ('elected', 'asked', 'pushed', 'failed', 'skipped')),
+    push_error   TEXT,
+    pushed_at    TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_shopping_product_session ON shopping_product(session_id);
+CREATE INDEX IF NOT EXISTS idx_shopping_preference_type ON shopping_preference(pref_type);
+CREATE INDEX IF NOT EXISTS idx_cart_item_menu ON cart_item(menu_slug, status);
+
+-- Garde-manger : la DB est la source de vérité (pas le vault Markdown, qui n'est
+-- qu'une source d'ingestion parmi d'autres — Drive A, voix, API).
+-- Contrainte UNIQUE sur (name_normalized, section) : un produit par rayon.
+-- Les items ajoutés par API/MCP vivent ici même si le vault ne les mentionne pas.
+CREATE TABLE IF NOT EXISTS pantry_item (
+    id                  SERIAL PRIMARY KEY,
+    name                TEXT NOT NULL,
+    name_normalized     TEXT NOT NULL,
+    section             TEXT NOT NULL,
+    qty_text            TEXT DEFAULT '',
+    qty_value           NUMERIC,
+    unit                TEXT,
+    status              TEXT NOT NULL DEFAULT 'ok',
+    xstatus             TEXT NOT NULL DEFAULT 'ok',
+    perishable          BOOLEAN NOT NULL DEFAULT FALSE,
+    entered_at          DATE,
+    source              TEXT DEFAULT 'vault',
+    food_key            TEXT,
+    shopping_product_id INTEGER REFERENCES shopping_product(id) ON DELETE SET NULL,
+    notes               TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (name_normalized, section)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pantry_item_status ON pantry_item(status);
+CREATE INDEX IF NOT EXISTS idx_pantry_item_norm ON pantry_item(name_normalized);
+CREATE INDEX IF NOT EXISTS idx_pantry_item_section ON pantry_item(section);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Tablée — qui mange à quel repas
+--
+-- Remplace le booléen at_home et les constantes ADULTS/CHILDREN en dur
+-- dans presence.py. La table `convive` reste pour rétrocompatibilité ;
+-- `person` en est le successeur fonctionnel.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- person : registre universel de quiconque peut s'asseoir à table.
+-- Un seul registre, quel que soit le cercle (foyer, famille, ami, ponctuel).
+CREATE TABLE IF NOT EXISTS person (
+    id                  SERIAL PRIMARY KEY,
+    name                TEXT NOT NULL,
+    full_name           TEXT,
+    circle              TEXT NOT NULL DEFAULT 'occasional'
+                        CHECK (circle IN ('household', 'extended_family', 'friend', 'occasional')),
+    role                TEXT NOT NULL DEFAULT 'adult'
+                        CHECK (role IN ('adult', 'child', 'caregiver')),
+    diet                TEXT NOT NULL DEFAULT 'omnivore',
+    dislikes            TEXT[] DEFAULT '{}',
+    forbidden           TEXT[] DEFAULT '{}',
+    diet_exceptions     TEXT[] DEFAULT '{}',
+    notes               TEXT,
+    default_attendance  TEXT NOT NULL DEFAULT 'never'
+                        CHECK (default_attendance IN ('always', 'never', 'scheduled')),
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    birth_date          DATE,
+    height_cm           NUMERIC,
+    weight_kg           NUMERIC,
+    activity_level      TEXT CHECK (activity_level IN ('low', 'moderate', 'high', 'very_high')),
+    nutrition_notes     TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (name, circle)
+);
+
+-- dietary_preference : le troisième cran, entre l'interdit et l'aversion — elle
+-- pèse sur la composition sans produire de conflit. person_id NULL = tout le foyer.
+CREATE TABLE IF NOT EXISTS dietary_preference (
+    id          SERIAL PRIMARY KEY,
+    person_id   INTEGER REFERENCES person(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL
+                CHECK (kind IN ('minimize', 'maximize', 'cap', 'rotate', 'no_restriction')),
+    target      TEXT NOT NULL,
+    value       NUMERIC,
+    unit        TEXT,
+    scope       TEXT CHECK (scope IN ('meal', 'day', 'week')),
+    reason      TEXT,
+    since       DATE NOT NULL DEFAULT CURRENT_DATE,
+    until       DATE,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- COALESCE : person_id NULL (règle de foyer) ne serait jamais dédoublonné par
+-- un UNIQUE ordinaire — NULL n'est égal à rien, pas même à lui-même.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dietary_preference_unique
+    ON dietary_preference (COALESCE(person_id, 0), kind, target);
+
+-- relationship : liens entre personnes (parent/enfant, conjoint, fratrie).
+-- Stocké dans un seul sens : parent_of = person_id est le parent.
+-- L'inverse se déduit (« les enfants de Pierre » = WHERE type='parent_of'
+-- AND person_id = Pierre).
+CREATE TABLE IF NOT EXISTS relationship (
+    id          SERIAL PRIMARY KEY,
+    person_id   INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    related_id  INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    type        TEXT NOT NULL CHECK (type IN ('parent_of', 'partner', 'sibling')),
+    UNIQUE (person_id, related_id, type),
+    CHECK (person_id != related_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_relationship_person ON relationship(person_id);
+CREATE INDEX IF NOT EXISTS idx_relationship_related ON relationship(related_id);
+
+-- household : un foyer = un groupe de personnes qui vivent ensemble.
+-- Le foyer principal (is_primary) fournit les résidents par défaut.
+-- D'autres foyers (« chez Pierre ») servent à modéliser la garde croisée
+-- et les séjours (« vacances chez les grands-parents »).
+CREATE TABLE IF NOT EXISTS household (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    is_primary  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_household_one_primary
+    ON household (is_primary) WHERE is_primary;
+
+CREATE TABLE IF NOT EXISTS household_member (
+    household_id INTEGER NOT NULL REFERENCES household(id) ON DELETE CASCADE,
+    person_id    INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    membership   TEXT NOT NULL DEFAULT 'resident'
+                 CHECK (membership IN ('resident', 'regular_guest')),
+    PRIMARY KEY (household_id, person_id)
+);
+
+-- person_group : raccourci nommé pour ajouter plusieurs personnes d'un coup
+-- (« la famille Martin » = 4 person_id). auto_generated = créé depuis les
+-- relations (ex. « les grands-parents » = tous les person avec
+-- relationship parent_of vers un adulte du foyer principal).
+CREATE TABLE IF NOT EXISTS person_group (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT UNIQUE NOT NULL,
+    auto_generated  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS person_group_member (
+    group_id    INTEGER NOT NULL REFERENCES person_group(id) ON DELETE CASCADE,
+    person_id   INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, person_id)
+);
+
+-- custody_schedule : garde alternée par enfant. Remplace les constantes
+-- CUSTODY_REFERENCE_WEEK et CHILDREN en dur dans presence.py.
+-- Chaque enfant peut avoir son propre rythme et sa propre date de référence
+-- (garde croisée : les enfants du conjoint viennent les semaines inverses).
+CREATE TABLE IF NOT EXISTS custody_schedule (
+    id                  SERIAL PRIMARY KEY,
+    person_id           INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    pattern             TEXT NOT NULL DEFAULT 'alternating_weeks'
+                        CHECK (pattern IN ('alternating_weeks', 'specific_days', 'always', 'gcal')),
+    reference_date      DATE NOT NULL,
+    reference_present   BOOLEAN NOT NULL DEFAULT TRUE,
+    weekday_override    JSONB,
+    notes               TEXT,
+    UNIQUE (person_id)
+);
+
+-- recipe_feedback : appréciation d'UNE personne sur UN plat servi. Les valeurs
+-- viennent de cooking-vocabulary (facettes appreciations / replay_verdicts /
+-- issue_kinds), pas d'un enum écrit ici — voir ADR 0005.
+CREATE TABLE IF NOT EXISTS recipe_feedback (
+    id             SERIAL PRIMARY KEY,
+    recipe_id      INTEGER REFERENCES recipe(id) ON DELETE CASCADE,
+    menu_meal_id   INTEGER REFERENCES menu_meal(id) ON DELETE SET NULL,
+    person_id      INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    served_on      DATE NOT NULL,
+    appreciation   TEXT NOT NULL,
+    verbatim       TEXT,
+    source         TEXT NOT NULL DEFAULT 'review',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (person_id, served_on, recipe_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recipe_feedback_recipe ON recipe_feedback(recipe_id);
+CREATE INDEX IF NOT EXISTS idx_recipe_feedback_person ON recipe_feedback(person_id);
+
+-- recipe_verdict : que fait-on du PLAT ensuite — une ligne par plat servi, pas
+-- par convive. Un plat adoré peut sortir de la rotation (trop long) : ce verdict
+-- ne se déduit pas des appréciations.
+CREATE TABLE IF NOT EXISTS recipe_verdict (
+    id           SERIAL PRIMARY KEY,
+    recipe_id    INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    served_on    DATE NOT NULL,
+    verdict      TEXT NOT NULL,
+    issue_kinds  TEXT[] NOT NULL DEFAULT '{}',
+    verbatim     TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (recipe_id, served_on)
+);
+
+-- child_week_presence : cache par semaine de l'event gcal, lu dans un agenda partagé.
+CREATE TABLE IF NOT EXISTS child_week_presence (
+    week_monday DATE PRIMARY KEY,
+    present     BOOLEAN NOT NULL,
+    synced_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- canteen_schedule : cantine par enfant et par jour. Remplace le test
+-- « day.weekday() in (1, 3, 4) » en dur dans presence.py.
+-- active_outside_holidays = TRUE signifie que la cantine n'existe QUE
+-- hors vacances scolaires (le comportement actuel pour tous les enfants).
+CREATE TABLE IF NOT EXISTS canteen_schedule (
+    id                      SERIAL PRIMARY KEY,
+    person_id               INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    weekday                 INTEGER NOT NULL CHECK (weekday >= 0 AND weekday <= 6),
+    slot                    TEXT NOT NULL DEFAULT 'lunch',
+    active_outside_holidays BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (person_id, weekday, slot)
+);
+
+-- meal_attendance : la tablée effective — qui mange quoi quand.
+-- Calculée automatiquement depuis les schedules (source='computed'),
+-- modifiable manuellement ('manual') ou par commande vocale ('voice').
+-- extra_headcount couvre les « +3 anonymes sans profil ».
+-- person_id est nullable : un extra_headcount sans person_id = invités anonymes.
+CREATE TABLE IF NOT EXISTS meal_attendance (
+    id              SERIAL PRIMARY KEY,
+    menu_id         INTEGER REFERENCES menu(id) ON DELETE CASCADE,
+    day             DATE NOT NULL,
+    slot            TEXT NOT NULL CHECK (slot IN ('breakfast', 'lunch', 'snack', 'dinner')),
+    person_id       INTEGER REFERENCES person(id) ON DELETE SET NULL,
+    source          TEXT NOT NULL DEFAULT 'computed'
+                    CHECK (source IN ('computed', 'manual', 'voice')),
+    extra_headcount INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_meal_attendance_menu_day ON meal_attendance(menu_id, day, slot);
+CREATE INDEX IF NOT EXISTS idx_meal_attendance_person ON meal_attendance(person_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meal_attendance_unique
+    ON meal_attendance(menu_id, day, slot, person_id) WHERE person_id IS NOT NULL;
+
+-- school_period : vacances scolaires. Remplace le tableau §Vacances de
+-- Presences.md — la trame de présence (cantine) en dépend, donc la DB doit
+-- en être la source, pas un Markdown lu à la volée.
+CREATE TABLE IF NOT EXISTS school_period (
+    id          SERIAL PRIMARY KEY,
+    label       TEXT NOT NULL,
+    start_date  DATE NOT NULL,
+    end_date    DATE NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- absence : une personne absente sur une période. slot NULL = toute la
+-- journée ; slot renseigné = un seul créneau (« déjeune au bureau ce midi »).
+-- Remplace le tableau §Absences de Presences.md.
+CREATE TABLE IF NOT EXISTS absence (
+    id          SERIAL PRIMARY KEY,
+    person_id   INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    start_date  DATE NOT NULL,
+    end_date    DATE NOT NULL,
+    slot        TEXT CHECK (slot IN ('breakfast', 'lunch', 'snack', 'dinner')),
+    reason      TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_absence_person ON absence(person_id);
+CREATE INDEX IF NOT EXISTS idx_absence_dates ON absence(start_date, end_date);
+
+-- stay : un séjour hors du domicile principal (vacances, week-end).
+-- C'est le modèle qui MANQUAIT et qui causait le bug Talence (F.30) : une
+-- « absence » du foyer principal était lue comme « pas de repas à préparer »,
+-- alors qu'on cuisine sur place. Un stay dit : ces personnes sont présentes
+-- et à table sur cette période, quelle que soit la trame de garde/cantine.
+--   cooking = TRUE  → on cuisine sur place (location, camping) — F.30
+--   cooking = FALSE → pas de cuisine (hôtel, club vacances) — F.31
+-- Un stay avec cooking=TRUE court-circuite la trame ET les absences : ses
+-- membres sont à table pour tous les repas du séjour.
+CREATE TABLE IF NOT EXISTS stay (
+    id          SERIAL PRIMARY KEY,
+    label       TEXT NOT NULL,
+    start_date  DATE NOT NULL,
+    end_date    DATE NOT NULL,
+    location    TEXT,
+    cooking     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stay_dates ON stay(start_date, end_date);
+
+CREATE TABLE IF NOT EXISTS stay_member (
+    stay_id     INTEGER NOT NULL REFERENCES stay(id) ON DELETE CASCADE,
+    person_id   INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+    PRIMARY KEY (stay_id, person_id)
+);
+
+-- food : ce qu'une recette consomme et dont on calcule les macros — du comté.
+-- product : ce qu'on achète — Comté Juraflore AOP 250 g. Les deux vivaient
+-- confondus dans `aliments-vérifiés/`, où la distinction existait par dossier
+-- (generiques/ vs marques/) sans que rien ne la lise. SPEC_referentiel-aliment-produit.
+CREATE TABLE IF NOT EXISTS food (
+    key             TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    category        TEXT,
+    kind            TEXT,
+    ciqual_code     TEXT,
+    conservation    TEXT,
+    source          TEXT,
+    verified_at     DATE,
+    pantry_staple   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- food_form : lentille crue et lentille cuite n'ont pas les mêmes macros, et
+-- une colonne unique ne pouvait en porter qu'une — les 18 aliments multi-formes
+-- n'ont jamais pu être importés. Source unique des macros d'aliment. Refs #97.
+CREATE TABLE IF NOT EXISTS food_form (
+    food_key TEXT NOT NULL REFERENCES food(key) ON DELETE CASCADE,
+    label    TEXT NOT NULL,
+    kcal     REAL,
+    protein  REAL,
+    carbs    REAL,
+    fat      REAL,
+    PRIMARY KEY (food_key, label)
+);
+
+-- Le gramme ne couvre que 38 % des lignes d'ingrédients : un aliment doit
+-- pouvoir se compter en pièce, gousse, tranche ou scoop, chacune avec son poids.
+CREATE TABLE IF NOT EXISTS food_unit (
+    food_key   TEXT NOT NULL REFERENCES food(key) ON DELETE CASCADE,
+    unit       TEXT NOT NULL,
+    grams      REAL NOT NULL,
+    source     TEXT,
+    PRIMARY KEY (food_key, unit)
+);
+
+-- ⚠️ ON DELETE SET NULL, jamais CASCADE : supprimer un aliment ne doit pas
+-- effacer l'historique des produits achetés — leçon des 7 alias emportés le
+-- 2026-09-07. `status` vaut 'linked' ou 'a_rapprocher' : jamais d'état
+-- intermédiaire silencieux.
+CREATE TABLE IF NOT EXISTS product (
+    id              SERIAL PRIMARY KEY,
+    food_key        TEXT REFERENCES food(key) ON DELETE SET NULL,
+    name            TEXT NOT NULL,
+    brand           TEXT,
+    ean             TEXT,
+    store           TEXT,
+    store_ref       TEXT,
+    pack_count      REAL,
+    pack_size_value REAL,
+    pack_size_unit  TEXT,
+    nutriscore      TEXT,
+    macros_per_100g JSONB,
+    last_price      REAL,
+    price_per_kg    REAL,
+    price_seen_at   DATE,
+    status          TEXT DEFAULT 'linked',
+    source          TEXT,
+    nature          TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (store, store_ref)
+);
+
+CREATE INDEX IF NOT EXISTS product_food_idx ON product(food_key);
+CREATE INDEX IF NOT EXISTS product_ean_idx ON product(ean);
+
+-- nutrition_target : les cibles macros d'une JOURNÉE TYPE, telles que la source les
+-- énonce. `source` et `since` disent d'où elles viennent et depuis quand ; l'âge se
+-- lit, il ne se juge pas (aucun seuil de péremption). Pas de colonne `day_kind` :
+-- la source retenue ne décrit qu'une journée. ADR 0033.
+CREATE TABLE IF NOT EXISTS nutrition_target (
+    id           SERIAL PRIMARY KEY,
+    person_id    INTEGER REFERENCES person(id) ON DELETE CASCADE,
+    kcal_min     NUMERIC,
+    kcal_max     NUMERIC,
+    protein_min  NUMERIC,
+    protein_max  NUMERIC,
+    carbs_min    NUMERIC,
+    carbs_max    NUMERIC,
+    fat_min      NUMERIC,
+    fat_max      NUMERIC,
+    source       TEXT NOT NULL,
+    since        DATE NOT NULL,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (person_id)
+);
+
+-- arbitration : une seule file pour tout rapprochement qu'aucun étage n'a su
+-- trancher — `subject` dit CE QUI est en jeu (`food_key` pour un rattachement,
+-- `food_kind` pour une famille). Deux portes sur la même file, Claude Code
+-- pendant la course et `web/` à tête reposée (ADR 0032).
+-- ⚠️ `status='settled'` avec `decision IS NULL` veut dire « instruit, hors
+-- référentiel » — c'est ce qui distingue un sujet JUGÉ d'un sujet jamais vu.
+CREATE TABLE IF NOT EXISTS arbitration (
+    id          SERIAL PRIMARY KEY,
+    subject     TEXT NOT NULL CHECK (subject IN ('food_key', 'food_kind')),
+    scope       TEXT NOT NULL,
+    ref         TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    candidates  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reason      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'settled')),
+    decision    TEXT,
+    decided_by  TEXT,
+    decided_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (subject, scope, ref)
+);
+
+CREATE INDEX IF NOT EXISTS arbitration_pending_idx ON arbitration(subject, status);
+
+-- Le garde-manger confronté avant qu'un panier parte (#161). Une ligne par menu.
+-- ⚠️ `blind = TRUE` veut dire qu'AUCUNE ligne n'a été regardée : `reason` dit
+-- pourquoi, et la liste de courses doit le porter. Un blind sans motif n'est pas
+-- une confirmation — c'est ce qui distingue une échappatoire d'un contournement.
+CREATE TABLE IF NOT EXISTS pantry_confirmation (
+    id           SERIAL PRIMARY KEY,
+    menu_slug    TEXT NOT NULL UNIQUE,
+    confirmed_at DATE NOT NULL DEFAULT CURRENT_DATE,
+    blind        BOOLEAN NOT NULL DEFAULT FALSE,
+    reason       TEXT,
+    lines_count  INTEGER NOT NULL DEFAULT 0,
+    detail       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Le journal des gates (spec 01, ADR 0044) : EN AJOUT SEUL, jamais d'UPDATE ni de DELETE.
+-- Une ligne par gate exigé à chaque tentative de transition, et une par `verify`.
+CREATE TABLE IF NOT EXISTS gate_verdict (
+    id               BIGSERIAL PRIMARY KEY,
+    measured_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    menu_slug        TEXT NOT NULL,
+    gate_id          TEXT NOT NULL,
+    transition       TEXT NOT NULL
+                     CHECK (transition IN ('publish', 'elect', 'push', 'order', 'verify')),
+    state            TEXT NOT NULL
+                     CHECK (state IN ('mesuré_ok', 'mesuré_ko', 'non_mesuré', 'pas_câblé')),
+    value            NUMERIC,
+    threshold        NUMERIC,
+    detail           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outcome          TEXT NOT NULL CHECK (outcome IN ('passé', 'refusé', 'forcé', 'mesuré')),
+    override_reason  TEXT,
+    actor            TEXT NOT NULL CHECK (actor IN ('agent', 'ipad')),
+    cart_fingerprint TEXT
+);
+"""
+
+MIGRATIONS_SQL = """
+ALTER TABLE recipe ADD COLUMN IF NOT EXISTS body TEXT;
+ALTER TABLE recipe ADD COLUMN IF NOT EXISTS sub_recipes TEXT[] DEFAULT '{}';
+ALTER TABLE recipe_execution ADD COLUMN IF NOT EXISTS appreciation_date DATE;
+
+-- `ALTER COLUMN ... USING` réécrit toute la table sous ACCESS EXCLUSIVE même quand
+-- le type est déjà le bon : sans ce garde, chaque redémarrage réécrivait `recipe`.
+DO $recipe_numeric$
+DECLARE col TEXT;
+BEGIN
+  FOREACH col IN ARRAY ARRAY['macros_kcal', 'macros_protein', 'macros_carbs',
+                             'macros_fat', 'protein_density'] LOOP
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'recipe' AND column_name = col
+                  AND data_type <> 'numeric') THEN
+      EXECUTE format('ALTER TABLE recipe ALTER COLUMN %I TYPE NUMERIC USING %I::numeric', col, col);
+    END IF;
+  END LOOP;
+END
+$recipe_numeric$;
+
+-- L'aliment est la seule cle d'appariement entre un achat, une ligne de stock et
+-- un ingredient de recette (ADR 0032). `ON DELETE SET NULL`, jamais CASCADE :
+-- supprimer un aliment ne doit effacer ni un stock ni un ingredient.
+ALTER TABLE pantry_item       ADD COLUMN IF NOT EXISTS food_key TEXT;
+ALTER TABLE recipe_ingredient ADD COLUMN IF NOT EXISTS food_key TEXT;
+
+-- La part d'un convive est une DONNEE, pas une parenthese dans `raw` (#159).
+-- `replaces_position` dit quelle ligne du plat commun cette part remplace POUR
+-- cette personne : sans elle, la part s'ajoute au plat au lieu de s'y substituer.
+-- ON DELETE SET NULL : retirer une personne du referentiel ne doit pas effacer
+-- la ligne d'ingredient -- elle redeviendrait du plat commun en silence.
+ALTER TABLE recipe_ingredient ADD COLUMN IF NOT EXISTS for_person_id     INTEGER;
+ALTER TABLE recipe_ingredient ADD COLUMN IF NOT EXISTS replaces_position INTEGER;
+
+DO $for_person_fk$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                  WHERE conname = 'recipe_ingredient_for_person_id_fkey') THEN
+    ALTER TABLE recipe_ingredient ADD CONSTRAINT recipe_ingredient_for_person_id_fkey
+      FOREIGN KEY (for_person_id) REFERENCES person(id) ON DELETE SET NULL;
+  END IF;
+END
+$for_person_fk$;
+
+CREATE INDEX IF NOT EXISTS recipe_ingredient_for_person_idx
+    ON recipe_ingredient(for_person_id) WHERE for_person_id IS NOT NULL;
+
+DO $food_key_fk$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'pantry_item_food_key_fkey') THEN
+    ALTER TABLE pantry_item ADD CONSTRAINT pantry_item_food_key_fkey
+      FOREIGN KEY (food_key) REFERENCES food(key) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'recipe_ingredient_food_key_fkey') THEN
+    ALTER TABLE recipe_ingredient ADD CONSTRAINT recipe_ingredient_food_key_fkey
+      FOREIGN KEY (food_key) REFERENCES food(key) ON DELETE SET NULL;
+  END IF;
+END
+$food_key_fk$;
+
+CREATE INDEX IF NOT EXISTS pantry_item_food_idx       ON pantry_item(food_key);
+CREATE INDEX IF NOT EXISTS recipe_ingredient_food_idx ON recipe_ingredient(food_key);
+
+-- status : une session existait avant la colonne parce qu'une commande etait
+-- passee — son defaut retrospectif est donc `ordered`, celui des suivantes `cart`.
+ALTER TABLE shopping_session ADD COLUMN IF NOT EXISTS status TEXT;
+UPDATE shopping_session SET status = 'ordered' WHERE status IS NULL;
+ALTER TABLE shopping_session ALTER COLUMN status SET DEFAULT 'cart';
+ALTER TABLE shopping_session ALTER COLUMN status SET NOT NULL;
+
+DO $session_status$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'shopping_session_status_check') THEN
+    ALTER TABLE shopping_session ADD CONSTRAINT shopping_session_status_check
+      CHECK (status IN ('cart', 'ordered', 'abandoned'));
+  END IF;
+END
+$session_status$;
+
+-- nature : un produit porte-t-il les macros d'UN aliment (`single`) ou les
+-- siennes propres (`composite`) ? Sans elle, `food_key` vide veut dire deux
+-- choses incompatibles — « aliment manquant au référentiel » et « n'en a pas ».
+-- Le compteur unlinked_products annonçait 160 lacunes pour 83 réelles. Refs #90.
+ALTER TABLE product ADD COLUMN IF NOT EXISTS nature TEXT;
+CREATE INDEX IF NOT EXISTS product_nature_idx ON product(nature);
+
+-- diet_exceptions : ce que le régime interdit mais que CETTE personne mange.
+-- Sans cette colonne, un régime est un absolu — or Claire est pescétarienne
+-- ET mange du boudin. Le contrôle bloquait un plat qu'elle accepte, et le seul
+-- contournement était de mentir sur son régime.
+ALTER TABLE person ADD COLUMN IF NOT EXISTS diet_exceptions TEXT[] DEFAULT '{}';
+
+-- Un alias vise un NOM, pas un id que l'ingestion emporte — ADR 0008.
+ALTER TABLE pantry_alias ADD COLUMN IF NOT EXISTS target_normalized TEXT;
+UPDATE pantry_alias a SET target_normalized = p.name_normalized
+  FROM pantry_item p WHERE p.id = a.pantry_item_id AND a.target_normalized IS NULL;
+ALTER TABLE pantry_alias ALTER COLUMN pantry_item_id DROP NOT NULL;
+DO $alias_fk$
+BEGIN
+    ALTER TABLE pantry_alias DROP CONSTRAINT pantry_alias_pantry_item_id_fkey;
+    ALTER TABLE pantry_alias ADD CONSTRAINT pantry_alias_pantry_item_id_fkey
+        FOREIGN KEY (pantry_item_id) REFERENCES pantry_item(id) ON DELETE SET NULL;
+EXCEPTION
+    WHEN undefined_object THEN NULL;
+END $alias_fk$;
+
+-- Profil nutritionnel : sans lui, aucune portion n'est dérivable de la base et
+-- « combien pour chacun » n'a pas de réponse mesurable. Refs #78.
+ALTER TABLE person ADD COLUMN IF NOT EXISTS birth_date      DATE;
+ALTER TABLE person ADD COLUMN IF NOT EXISTS height_cm       NUMERIC;
+ALTER TABLE person ADD COLUMN IF NOT EXISTS weight_kg       NUMERIC;
+ALTER TABLE person ADD COLUMN IF NOT EXISTS activity_level  TEXT;
+ALTER TABLE person ADD COLUMN IF NOT EXISTS nutrition_notes TEXT;
+DO $act$
+BEGIN
+    ALTER TABLE person ADD CONSTRAINT person_activity_level_check
+        CHECK (activity_level IN ('low', 'moderate', 'high', 'very_high'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $act$;
+
+-- menu_meal.served : un menu est un PLAN, pas un historique. NULL dit « on ne
+-- sait pas », et c'est l'état honnête de tout le passé. Sans ce tri-état, un
+-- repas jamais cuisiné se compte comme mangé dans toute rotation.
+ALTER TABLE menu_meal ADD COLUMN IF NOT EXISTS served BOOLEAN;
+
+ALTER TABLE menu ADD COLUMN IF NOT EXISTS meals JSONB;
+ALTER TABLE menu ADD COLUMN IF NOT EXISTS body TEXT;
+-- Dernière réécriture réelle des repas (`ingested_at` bouge à chaque POST) : périme les lignes du panier (#186).
+ALTER TABLE menu ADD COLUMN IF NOT EXISTS meals_changed_at TIMESTAMPTZ;
+
+-- menu.slug : clé naturelle, sans laquelle l'ingestion ne peut pas dédoublonner
+-- (elle se protégeait par un DELETE FROM menu qui détruisait les menus absents du vault).
+-- Ajout en 3 temps : colonne nullable -> backfill -> contrainte, sinon l'ALTER échoue
+-- sur les lignes existantes.
+ALTER TABLE menu ADD COLUMN IF NOT EXISTS slug TEXT;
+UPDATE menu SET slug = 'legacy-' || id::text WHERE slug IS NULL OR slug = '';
+DO $mig$
+BEGIN
+    ALTER TABLE menu ADD CONSTRAINT menu_slug_key UNIQUE (slug);
+EXCEPTION
+    WHEN duplicate_table THEN NULL;
+    WHEN duplicate_object THEN NULL;
+END $mig$;
+ALTER TABLE menu ALTER COLUMN slug SET NOT NULL;
+
+-- Auto-nettoyage : une ligne backfillée en 'legacy-N' disparaît dès que la vraie
+-- (même titre, slug issu du vault) a été ingérée. Ne supprime jamais un menu
+-- qui n'aurait pas de remplaçant.
+DELETE FROM menu m
+ WHERE m.slug LIKE 'legacy-%'
+   AND EXISTS (SELECT 1 FROM menu o
+                WHERE o.title = m.title AND o.slug NOT LIKE 'legacy-%');
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS drive_a_id TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS nutriscore TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS nutrition JSONB;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS ingredients TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS allergens TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS characteristics JSONB;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS photo_url TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS product_url TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS weight TEXT;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS price_per_kg REAL;
+
+ALTER TABLE shopping_session ALTER COLUMN total TYPE NUMERIC USING total::numeric;
+ALTER TABLE shopping_product ALTER COLUMN price_unit   TYPE NUMERIC USING price_unit::numeric;
+ALTER TABLE shopping_product ALTER COLUMN total_price  TYPE NUMERIC USING total_price::numeric;
+ALTER TABLE shopping_product ALTER COLUMN price_per_kg TYPE NUMERIC USING price_per_kg::numeric;
+ALTER TABLE shopping_product ADD COLUMN IF NOT EXISTS ean TEXT;
+ALTER TABLE menu_meal ADD COLUMN IF NOT EXISTS covers INTEGER;
+
+-- household_member: rename role → membership (avoids confusion with person.role)
+DO $rename_hm$
+BEGIN
+    ALTER TABLE household_member RENAME COLUMN role TO membership;
+EXCEPTION
+    WHEN undefined_column THEN NULL;
+END $rename_hm$;
+
+-- household: guarantee at most one primary
+CREATE UNIQUE INDEX IF NOT EXISTS idx_household_one_primary
+    ON household (is_primary) WHERE is_primary;
+
+-- meal_attendance: prevent duplicate person per meal slot
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meal_attendance_unique
+    ON meal_attendance(menu_id, day, slot, person_id) WHERE person_id IS NOT NULL;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Migration tablée : convive → person + seed données initiales
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Migrer les convives existants vers person (idempotent).
+-- Le champ constraints stocke « diet:X », « avoid:Y », « dislike:Z ».
+INSERT INTO person (name, circle, role, diet, dislikes, forbidden, notes, default_attendance)
+SELECT
+    c.name,
+    CASE WHEN c.notes = 'invité récurrent' THEN 'extended_family' ELSE 'household' END,
+    'adult',
+    COALESCE((
+        SELECT REPLACE(unnest, 'diet:', '')
+        FROM unnest(c.constraints)
+        WHERE unnest LIKE 'diet:%'
+        LIMIT 1
+    ), 'omnivore'),
+    ARRAY(SELECT REPLACE(unnest, 'dislike:', '') FROM unnest(c.constraints) WHERE unnest LIKE 'dislike:%'),
+    ARRAY(SELECT REPLACE(unnest, 'avoid:', '') FROM unnest(c.constraints) WHERE unnest LIKE 'avoid:%'),
+    c.notes,
+    CASE WHEN c.notes = 'invité récurrent' THEN 'never' ELSE 'always' END
+FROM convive c
+WHERE NOT EXISTS (SELECT 1 FROM person p WHERE p.name = c.name)
+ON CONFLICT DO NOTHING;
+
+-- Seed le foyer principal (idempotent).
+INSERT INTO household (name, is_primary)
+SELECT 'Foyer', TRUE
+WHERE NOT EXISTS (SELECT 1 FROM household WHERE is_primary);
+
+-- Rattacher les membres du foyer au household principal.
+INSERT INTO household_member (household_id, person_id, membership)
+SELECT h.id, p.id, 'resident'
+FROM household h, person p
+WHERE h.is_primary AND p.circle = 'household'
+ON CONFLICT DO NOTHING;
+
+-- custody_schedule.pattern 'gcal' : la garde alternée réelle vit dans l'event
+-- gcal "Semaine enfants" (calendrier CAFS), pas dans une date de référence
+-- figée. Voir cooking_manager/child_week.py.
+ALTER TABLE custody_schedule DROP CONSTRAINT IF EXISTS custody_schedule_pattern_check;
+ALTER TABLE custody_schedule ADD CONSTRAINT custody_schedule_pattern_check
+    CHECK (pattern IN ('alternating_weeks', 'specific_days', 'always', 'gcal'));
+UPDATE custody_schedule SET pattern = 'gcal'
+WHERE person_id IN (SELECT id FROM person WHERE role = 'child' AND circle = 'household');
+
+-- Référentiel aliment & produit : le VPS a déjà les tables, toute évolution
+-- ultérieure d'une colonne passe par ici et non par SCHEMA_SQL.
+ALTER TABLE product ADD COLUMN IF NOT EXISTS price_seen_at DATE;
+ALTER TABLE product ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'linked';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Retours utilisateur v0.7.0 — 4 tables, ontologie cooking-vocabulary
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS product_remark (
+    id                  SERIAL PRIMARY KEY,
+    shopping_product_id INTEGER REFERENCES shopping_product(id) ON DELETE SET NULL,
+    product_ref         TEXT,
+    quality             TEXT NOT NULL,
+    channel             TEXT,
+    aspect              TEXT DEFAULT 'general',
+    verbatim            TEXT,
+    served_on           DATE,
+    person_id           INTEGER REFERENCES person(id) ON DELETE SET NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_product_remark_product ON product_remark(shopping_product_id);
+
+CREATE TABLE IF NOT EXISTS cooking_tip (
+    id          SERIAL PRIMARY KEY,
+    recipe_id   INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    step_number INTEGER,
+    verbatim    TEXT NOT NULL,
+    applied     BOOLEAN DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_cooking_tip_recipe ON cooking_tip(recipe_id);
+
+CREATE TABLE IF NOT EXISTS substitution_discovery (
+    id                    SERIAL PRIMARY KEY,
+    recipe_id             INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    original_ingredient   TEXT NOT NULL,
+    substitute_ingredient TEXT NOT NULL,
+    outcome               TEXT NOT NULL,
+    who_preferred         TEXT,
+    verbatim              TEXT,
+    served_on             DATE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (recipe_id, original_ingredient, substitute_ingredient)
+);
+CREATE INDEX IF NOT EXISTS idx_substitution_recipe ON substitution_discovery(recipe_id);
+
+CREATE TABLE IF NOT EXISTS service_context (
+    id         SERIAL PRIMARY KEY,
+    recipe_id  INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
+    context    TEXT NOT NULL,
+    verbatim   TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (recipe_id, context)
+);
+CREATE INDEX IF NOT EXISTS idx_service_context_recipe ON service_context(recipe_id);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- food_form : bascule des macros mono-forme, puis la colonne disparaît
+-- ═══════════════════════════════════════════════════════════════════════
+-- Le VPS a déjà `food` avec sa colonne JSONB : la copier ligne à ligne avant
+-- de la supprimer, sinon 163 aliments perdent leurs macros. Le DO avale
+-- undefined_column pour rester idempotent au deuxième passage. Refs #97.
+DO $food_form_mig$
+BEGIN
+    INSERT INTO food_form (food_key, label, kcal, protein, carbs, fat)
+    SELECT key,
+           COALESCE(NULLIF(macros_per_100g->>'form', ''), '100g'),
+           (macros_per_100g->>'kcal')::real,
+           (macros_per_100g->>'protein')::real,
+           (macros_per_100g->>'carbs')::real,
+           (macros_per_100g->>'fat')::real
+      FROM food
+     WHERE macros_per_100g IS NOT NULL
+    ON CONFLICT DO NOTHING;
+EXCEPTION
+    WHEN undefined_column THEN NULL;
+END $food_form_mig$;
+ALTER TABLE food DROP COLUMN IF EXISTS macros_per_100g;
+
+-- Basique du placard : couvre toute dose tant qu'une ligne vit, jamais confirmé chaque semaine (ADR 0043).
+ALTER TABLE food ADD COLUMN IF NOT EXISTS pantry_staple BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Cadre méditerranéen : food.kind devient un axe fermé — ADR 0033
+-- ═══════════════════════════════════════════════════════════════════════
+-- Les douze familles écrites au fil de l'eau passent en anglais, comme tout
+-- identifiant. Renommer sans migrer ferait mentir `satisfied_by`, qui cite les
+-- clés du vocabulaire : la couverture lirait zéro partout sans rien dire.
+UPDATE food SET kind = CASE kind
+    WHEN 'beurre'      THEN 'butter'
+    WHEN 'cereale'     THEN 'grain'
+    WHEN 'charcuterie' THEN 'cured-meat'
+    WHEN 'farine'      THEN 'flour'
+    WHEN 'fromage'     THEN 'cheese'
+    WHEN 'laitage'     THEN 'dairy'
+    WHEN 'legumineuse' THEN 'legume'
+    WHEN 'oleagineux'  THEN 'nut'
+    WHEN 'pain'        THEN 'bread'
+    WHEN 'panure'      THEN 'breading'
+    WHEN 'poisson'     THEN 'fish'
+    ELSE kind
+  END
+ WHERE kind IN ('beurre', 'cereale', 'charcuterie', 'farine', 'fromage', 'laitage',
+                'legumineuse', 'oleagineux', 'pain', 'panure', 'poisson');
+
+-- Les sept aliments sans rayon, qualifiés le 2026-09-23. `WHERE category IS NULL`
+-- pour qu'une correction ultérieure survive au redémarrage suivant.
+UPDATE food SET category = 'legumes'
+ WHERE key = 'courge butternut' AND category IS NULL;
+UPDATE food SET category = 'matieres-grasses'
+ WHERE key = 'lait de coco' AND category IS NULL;
+UPDATE food SET category = 'feculents-legumineuses'
+ WHERE key IN ('mais', 'pois chiche boite', 'riz complet') AND category IS NULL;
+UPDATE food SET category = 'oeufs-laitages'
+ WHERE key = 'poudre lait ecreme' AND category IS NULL;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- menu_meal.leftovers_of : un reste hérite de son plat source — #76
+-- ═══════════════════════════════════════════════════════════════════════
+-- Un repas de restes n'a pas de fiche PAR CONCEPTION (lui en donner une ferait
+-- racheter les ingrédients). Il échappait donc au contrôle de compatibilité :
+-- « restes des pilons de poulet » posé devant Claire, pescétarienne, ne levait
+-- rien. La colonne dit DE QUOI le repas est le reste ; le contrôle emprunte les
+-- ingrédients de la source, la liste de courses ne les voit jamais.
+-- ⚠️ Un reste sans source déclarée reste NON CONTRÔLABLE, et doit être NOMMÉ
+-- comme tel : `leftovers_unsourced` se lit avant `conflicts`.
+ALTER TABLE menu_meal ADD COLUMN IF NOT EXISTS leftovers_of INTEGER;
+
+DO $leftovers_fk$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'menu_meal_leftovers_of_fkey') THEN
+    ALTER TABLE menu_meal ADD CONSTRAINT menu_meal_leftovers_of_fkey
+      FOREIGN KEY (leftovers_of) REFERENCES menu_meal(id) ON DELETE SET NULL;
+  END IF;
+END
+$leftovers_fk$;
+
+CREATE INDEX IF NOT EXISTS menu_meal_leftovers_idx ON menu_meal(leftovers_of);
+
+-- Les cinq restes dont la source a été vérifiée le 2026-09-23 : le dîner de la
+-- veille, dans le même menu. `WHERE leftovers_of IS NULL` pour qu'une correction
+-- ultérieure survive au redémarrage suivant.
+UPDATE menu_meal reste SET leftovers_of = source.id
+  FROM menu_meal source, menu m
+ WHERE reste.menu_id = m.id AND source.menu_id = m.id
+   AND source.slot = 'dinner' AND reste.slot = 'lunch'
+   AND reste.match_kind = 'leftovers' AND reste.leftovers_of IS NULL
+   AND (m.slug, reste.position, source.position) IN (
+         ('2026-09-14_semaine-maison-enfants', 2, 1),
+         ('2026-09-14_semaine-maison-enfants', 4, 3),
+         ('2026-09-14_semaine-maison-enfants', 8, 7),
+         ('2026-09-28_semaine-maison-enfants', 2, 1),
+         ('2026-09-28_semaine-maison-enfants', 5, 4));
+
+-- Les trois repas du 2026-08-03 ne sont PAS des restes d'un plat : ce sont des
+-- assiettes composées sur le moment. `freestyle` le dit ; les appeler `leftovers`
+-- laissait croire qu'une source existait et qu'on avait omis de la déclarer.
+UPDATE menu_meal mm SET match_kind = 'freestyle'
+  FROM menu m
+ WHERE mm.menu_id = m.id AND m.slug = '2026-08-03_semaine-maison'
+   AND mm.position = 5 AND mm.match_kind = 'leftovers';
+
+-- Les rayons écrits au fil de l'eau : `feculent` et `feculents` désignent le même
+-- rayon que `feculents-legumineuses`, `oeufs` et `laitage` le même que
+-- `oeufs-laitages`. Deux orthographes du même rayon font deux groupes dans toute
+-- lecture groupée par `category`, sans qu'aucune ne soit fausse.
+UPDATE food SET category = 'feculents-legumineuses'
+ WHERE category IN ('feculent', 'feculents');
+UPDATE food SET category = 'oeufs-laitages'
+ WHERE category IN ('oeufs', 'laitage');
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- recipe.status : quatre valeurs, et plus une de plus — ADR 0034
+-- ═══════════════════════════════════════════════════════════════════════
+-- `valide` et `consommee` sont deux synonymes silencieux de `validated`, écrits
+-- parce que la colonne était un TEXT libre. Le CHECK vient APRÈS la migration :
+-- posé avant, il refuserait les lignes qu'il doit d'abord corriger.
+UPDATE recipe SET status = 'validated' WHERE status IN ('valide', 'consommee');
+
+DO $recipe_status$
+BEGIN
+    ALTER TABLE recipe ADD CONSTRAINT recipe_status_check
+        CHECK (status IN ('draft', 'to_test', 'active', 'validated'));
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $recipe_status$;
+
+-- La cible de Julien : les chiffres de la note du Coach Nutrition du 2026-05-22,
+-- maintenus par Julien après la révision v2.10.33 du 2026-07-17. Une seule ligne.
+INSERT INTO nutrition_target (person_id, kcal_min, kcal_max, protein_min, protein_max,
+                              carbs_min, carbs_max, fat_min, fat_max, source, since)
+SELECT p.id, 1800, 1900, 180, 200, 105, 140, 80, 90,
+       'Coach Nutrition — note de cadrage du 2026-05-22', DATE '2026-05-22'
+  FROM person p
+ WHERE p.name = 'Julien' AND p.circle = 'household'
+   AND NOT EXISTS (SELECT 1 FROM nutrition_target t WHERE t.person_id = p.id);
+
+-- Le journal des gates (spec 01, ADR 0044) : EN AJOUT SEUL, jamais d'UPDATE ni de DELETE.
+-- Une ligne par gate exigé à chaque tentative de transition, et une par `verify`.
+CREATE TABLE IF NOT EXISTS gate_verdict (
+    id               BIGSERIAL PRIMARY KEY,
+    measured_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    menu_slug        TEXT NOT NULL,
+    gate_id          TEXT NOT NULL,
+    transition       TEXT NOT NULL
+                     CHECK (transition IN ('publish', 'elect', 'push', 'order', 'verify')),
+    state            TEXT NOT NULL
+                     CHECK (state IN ('mesuré_ok', 'mesuré_ko', 'non_mesuré', 'pas_câblé')),
+    value            NUMERIC,
+    threshold        NUMERIC,
+    detail           JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outcome          TEXT NOT NULL CHECK (outcome IN ('passé', 'refusé', 'forcé', 'mesuré')),
+    override_reason  TEXT,
+    actor            TEXT NOT NULL CHECK (actor IN ('agent', 'ipad')),
+    cart_fingerprint TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_verdict_menu
+    ON gate_verdict (menu_slug, gate_id, measured_at DESC);
+"""
+
+_pool: asyncpg.Pool | None = None
+
+
+async def get_pool(dsn: str) -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+    return _pool
+
+
+async def init_schema(dsn: str) -> None:
+    pool = await get_pool(dsn)
+    async with pool.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
+        await conn.execute(MIGRATIONS_SQL)
+
+
+async def close_pool() -> None:
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None

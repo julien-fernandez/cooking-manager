@@ -1,0 +1,339 @@
+"""Profils alimentaires des convives, et contrôle de compatibilité d'un repas."""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+MEAT = (
+    "viande", "boeuf", "bœuf", "steak", "porc", "agneau", "veau", "lapin",
+    "jambon", "lardon", "bacon", "saucisse", "saucisson", "merguez", "chorizo",
+    "salami", "charcuterie", "roti", "rôti", "hachis", "bolognaise", "carbonara",
+    "lard", "guanciale", "pancetta", "coppa", "grisons", "prosciutto",
+    "mouton", "andouille", "boudin", "foie gras", "gesier", "gésier",
+)
+POULTRY = ("volaille", "poulet", "dinde", "canard", "magret", "escalope de poulet", "pintade")
+FISH = ("poisson", "saumon", "thon", "cabillaud", "lieu", "merlu", "merlan",
+        "sardine", "maquereau", "truite", "colin", "anchois", "dorade", "daurade", "bar")
+SEAFOOD = ("crevette", "gambas", "moule", "huitre", "huître", "calamar",
+           "poulpe", "crabe", "saint-jacques", "surimi")
+DAIRY = ("lait", "fromage", "beurre", "creme", "crème", "yaourt", "skyr",
+         "ricotta", "feta", "mozzarella", "parmesan")
+EGG = ("oeuf", "œuf")
+
+MEAT_IMPLIED_DISHES = frozenset({"bolognaise", "carbonara", "hachis"})
+
+_VEGGIE_MARKER = re.compile(
+    r"(?<!\w)(?:vegetarien(?:ne)?s?|vegetalien(?:ne)?s?|vegan|veggie)(?!\w)"
+)
+
+CONTEXT_REQUIRED: dict[str, str] = {
+    "roti": (
+        r"(?<!\w)rotis?\s+(?:(?:de|du|des)(?!\w)|d')"
+        r"|(?<!\w)(?:un|le|les|ce|ces|mon|notre)\s+rotis?(?!\w)"
+    ),
+    **dict.fromkeys(("pate", "pates"), (
+        r"(?<!\w)pates?(?!\w)(?!\s+(?:d['’\s]\s*|de\s+|a\s+)"
+        r"(?:arachide|cacahuete|curry|lentille|pois|haricot|legumineuse|sesame|amande"
+        r"|noisette|datte|miso|piment|tamarin|riz|sarrasin|mais|tartiner))"
+    )),
+}
+
+DIETS: dict[str, tuple[str, ...]] = {
+    "pescetarian": MEAT + POULTRY,
+    "vegetarian": MEAT + POULTRY + FISH + SEAFOOD,
+    "vegan": MEAT + POULTRY + FISH + SEAFOOD + DAIRY + EGG,
+    "semi-vegetarian": (),
+    "omnivore": (),
+    "standard": (),
+}
+
+DIET_ALIASES: dict[str, str] = {
+    "pescetarien": "pescetarian", "pescetarienne": "pescetarian",
+    "pesco-vegetarien": "pescetarian", "pesco-mediterraneen": "pescetarian",
+    "vegetarien": "vegetarian", "vegetarienne": "vegetarian",
+    "vegetalien": "vegan", "vegan": "vegan",
+    "semi-vegetarien": "semi-vegetarian",
+    "omnivore": "omnivore", "standard": "standard",
+}
+
+_LIGATURES = str.maketrans({"œ": "oe", "Œ": "OE", "æ": "ae", "Æ": "AE"})
+
+def _fold(text: str) -> str:
+    """Minuscules sans accents ni ligatures — pour comparer des libellés libres."""
+    expanded = str(text).translate(_LIGATURES)
+    normalized = unicodedata.normalize("NFKD", expanded)
+    return normalized.encode("ascii", "ignore").decode("ascii").lower()
+
+@dataclass
+class Convive:
+    name: str
+    diet: str = "standard"
+    dislikes: list[str] = field(default_factory=list)
+    forbidden: list[str] = field(default_factory=list)
+    diet_exceptions: list[str] = field(default_factory=list)
+    notes: str = ""
+    is_guest: bool = False
+
+    @property
+    def diet_terms(self) -> list[str]:
+        """Ce que le régime de cette personne interdit — alias français compris."""
+        return list(DIETS.get(self.diet) or DIETS.get(_parse_diet(self.diet), ()))
+
+    def diet_waived_on(self, folded_text: str) -> str | None:
+        """L'exception qui dispense CE texte du régime — voir ADR 0003."""
+        for exception in self.diet_exceptions:
+            if _contains_term(folded_text, _fold(exception)):
+                return exception
+        return None
+
+    @property
+    def excluded_terms(self) -> list[str]:
+        """Tout ce qui doit déclencher une alerte pour cette personne."""
+        return self.diet_terms + self.dislikes + self.forbidden
+
+@dataclass
+class Conflict:
+    convive: str
+    reason: str
+    matched: str
+
+    def __str__(self) -> str:
+        return f"{self.convive} — {self.reason} : {self.matched}"
+
+_PERSON = re.compile(r"^###\s+(.+?)\s*$", re.MULTILINE)
+_FIELD = re.compile(r"^\s*-\s*\*\*(.+?)\*\*\s*[:：]\s*(.+?)\s*$", re.MULTILINE)
+_FORBIDDEN_LINE = re.compile(r"^\s*-\s*❌\s*(.+?)\s*$", re.MULTILINE)
+_GUEST_ROW = re.compile(r"^\|\s*\*\*(.+?)\*\*\s*\|([^|]*)\|([^|]*)\|([^|]*)\|", re.MULTILINE)
+_GUESTS_HEADER = re.compile(r"^##\s+.*invit[ée]s?\s+r[ée]currents?", re.MULTILINE | re.IGNORECASE)
+_NEXT_H2 = re.compile(r"^##\s+", re.MULTILINE)
+
+_NOT_A_PERSON = {
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+    "mais", "oeufs durs", "ufs durs", "aliment", "jour", "personne",
+}
+
+def _guests_section(body: str) -> str:
+    """Corps de la seule section « Invités récurrents »."""
+    header = _GUESTS_HEADER.search(body)
+    if not header:
+        return ""
+    rest = body[header.end():]
+    nxt = _NEXT_H2.search(rest)
+    return rest[: nxt.start()] if nxt else rest
+
+def _split_list(value: str) -> list[str]:
+    """« maïs, céleri, endive » → ['mais', 'celeri', 'endive »]."""
+    cleaned = re.sub(r"\([^)]*\)", " ", value)
+    cleaned = re.sub(r"\*\*", "", cleaned)
+    parts = re.split(r"[,;·]|\bet\b|\bou\b", cleaned)
+    out = []
+    for part in parts:
+        term = _fold(part).strip(" .·-—_")
+        if term and len(term) > 2 and term not in {"rien", "aucune", "aucun", "non documente"}:
+            out.append(term)
+    return out
+
+_REFUSES = re.compile(r"refuse\s+(.+)$", re.IGNORECASE)
+
+def _parse_egg_refusals(value: str) -> list[str]:
+    """« accepte coque, brouillés — **refuse dur, poché, au plat, mollet** »"""
+    m = _REFUSES.search(_fold(value).replace("**", ""))
+    if not m:
+        return []
+    out = []
+    for prep in _split_list(m.group(1)):
+        out.append(f"oeuf {prep}")
+    return out
+
+def _parse_diet(value: str) -> str:
+    """⚠️ Alias les plus longs d'abord : « semi-vegetarien » contient"""
+    folded = _fold(value)
+    for alias in sorted(DIET_ALIASES, key=len, reverse=True):
+        if alias in folded:
+            return DIET_ALIASES[alias]
+    return "standard"
+
+_PART = re.compile(r"\(([^)]*\bpart\b[^)]*)\)")
+
+def part_for(convive: str, ingredients: list[str]) -> str | None:
+    """L'ingrédient portant la part séparée de ce convive, ou None — ADR 0025."""
+    wanted = _fold(convive).split()[0] if convive else ""
+    if not wanted:
+        return None
+    for raw in ingredients:
+        folded = _fold(str(raw))
+        if any(wanted in group for group in _PART.findall(folded)):
+            return str(raw)
+    return None
+
+def _contains_term(folded_text: str, term: str) -> bool:
+    """Terme présent en tant que MOT fléchi au pluriel, jamais en sous-chaîne — ADR 0003."""
+    if not term:
+        return False
+    return _term_pattern(term).search(folded_text) is not None
+
+@lru_cache(maxsize=None)
+def _term_pattern(term: str) -> re.Pattern[str]:
+    """Le terme en mots entiers, chaque mot tolérant sa marque de pluriel."""
+    forced = CONTEXT_REQUIRED.get(term)
+    if forced is not None:
+        return re.compile(forced)
+    words = [re.escape(word) for word in term.split() if word]
+    if not words:
+        return re.compile(r"(?!)")
+    body = r"[sx]?\s+".join(words)
+    return re.compile(rf"(?<!\w){body}[sx]?(?!\w)")
+
+def parse_convives(body: str) -> list[Convive]:
+    """Corps de `Convives.md` → profils exploitables."""
+    convives: list[Convive] = []
+    if not body:
+        return convives
+
+    matches = list(_PERSON.finditer(body))
+    for idx, m in enumerate(matches):
+        name = re.sub(r"\s*\(.*\)\s*$", "", m.group(1)).strip()
+        if not name or name.lower().startswith(("règles", "regles", "aversions", "substituts",
+                                                "semaine", "récap", "recap")):
+            continue
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
+        section = body[m.end():end]
+
+        convive = Convive(name=name)
+        for field_match in _FIELD.finditer(section):
+            label, value = _fold(field_match.group(1)), field_match.group(2)
+            if label.startswith("regime"):
+                convive.diet = _parse_diet(value)
+            elif "n'aime pas" in label or "naime pas" in label:
+                convive.dislikes = _split_list(value)
+            elif label.startswith(("oeufs", "ufs")):
+                convive.forbidden += _parse_egg_refusals(value)
+        convive.forbidden += [
+            t for line in _FORBIDDEN_LINE.findall(section) for t in _split_list(line)
+        ]
+        convives.append(convive)
+
+    guests_section = _guests_section(body)
+    for row in _GUEST_ROW.finditer(guests_section):
+        name = row.group(1).strip()
+        if any(c.name == name for c in convives) or _fold(name) in _NOT_A_PERSON:
+            continue
+        guest = Convive(name=name, is_guest=True)
+        guest.diet = _parse_diet(row.group(3))
+        avoid = row.group(4)
+        if "non documenté" not in avoid and "non documente" not in _fold(avoid):
+            guest.forbidden = _split_list(avoid)
+        convives.append(guest)
+
+    return convives
+
+def check_meal(description: str, convives: list[Convive]) -> list[Conflict]:
+    """Un intitulé de plat + les convives présents → la liste des conflits."""
+    conflicts: list[Conflict] = []
+    if not description:
+        return conflicts
+    folded = _fold(description)
+    veggie_declared = _VEGGIE_MARKER.search(folded) is not None
+
+    for convive in convives:
+        if convive.diet_waived_on(folded) is None:
+            diet_terms = convive.diet_terms
+        else:
+            diet_terms = []
+        for term in diet_terms:
+            if veggie_declared and _fold(term) in MEAT_IMPLIED_DISHES:
+                continue
+            if _contains_term(folded, _fold(term)):
+                conflicts.append(Conflict(convive.name, f"régime {convive.diet}", term))
+                break
+        for term in convive.forbidden:
+            if _contains_term(folded, _fold(term)):
+                conflicts.append(Conflict(convive.name, "interdit", term))
+                break
+        for term in convive.dislikes:
+            if _contains_term(folded, _fold(term)):
+                conflicts.append(Conflict(convive.name, "n'aime pas", term))
+                break
+
+    return conflicts
+
+def _folded_rows(ingredients: list) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for ing in ingredients:
+        get = ing.get if isinstance(ing, dict) else lambda k, o=ing: getattr(o, k, None)
+        folded = _fold(get("name_normalized") or get("name") or get("raw") or "")
+        if folded:
+            rows.append((folded, str(get("raw") or get("name") or "")))
+    return rows
+
+def check_ingredients(ingredients: list, convives: list[Convive],
+                      person_ids: dict[str, int] | None = None) -> list[Conflict]:
+    """Ingrédients PARSÉS + convives → conflits ; `person_ids` fait lire à chacun SA part (#159)."""
+    from cooking_manager.parts import lines_for_person
+
+    conflicts: list[Conflict] = []
+    if not ingredients:
+        return conflicts
+
+    all_rows = _folded_rows(ingredients)
+
+    for convive in convives:
+        person_id = (person_ids or {}).get(convive.name)
+        rows = (_folded_rows(lines_for_person(ingredients, person_id))
+                if person_ids is not None else all_rows)
+        seen: set[str] = set()
+        checks = (
+            [(t, f"régime {convive.diet}") for t in convive.diet_terms]
+            + [(t, "interdit") for t in convive.forbidden]
+            + [(t, "n'aime pas") for t in convive.dislikes]
+        )
+        for term, reason in checks:
+            if reason in seen:
+                continue
+            is_diet = reason.startswith("régime ")
+            for folded, raw in rows:
+                if not _contains_term(folded, _fold(term)):
+                    continue
+                if is_diet and convive.diet_waived_on(folded) is not None:
+                    continue
+                conflicts.append(Conflict(convive.name, reason, raw or term))
+                seen.add(reason)
+                break
+    return conflicts
+
+def check_menu(meals: list[dict], convives: list[Convive]) -> dict[str, list[Conflict]]:
+    """Menu complet → conflits par créneau, clé « jour/créneau »."""
+    slots = ("breakfast", "lunch", "snack", "dinner")
+    out: dict[str, list[Conflict]] = {}
+    for meal in meals or []:
+        day = meal.get("day", "?")
+        for slot in slots:
+            description = meal.get(slot)
+            if not description:
+                continue
+            conflicts = check_meal(description, convives)
+            if conflicts:
+                out[f"{day}/{slot}"] = conflicts
+    return out
+
+def inherit_leftovers(meals: list[dict], lines: dict[int, list],
+                      steps: dict[int, list]) -> list[dict]:
+    """Un reste emprunte les ingrédients de sa source ; sans source, il se nomme (#76)."""
+    unsourced: list[dict] = []
+    for meal in meals:
+        if meal.get("match_kind") != "leftovers":
+            continue
+        source = meal.get("leftovers_of")
+        if source is None or not lines.get(source):
+            unsourced.append({
+                "day": meal.get("day_label"), "slot": meal.get("slot"),
+                "dish": meal.get("dish"),
+                "reason": "reste sans plat source exploitable — rien à confronter",
+            })
+            continue
+        lines[meal["meal_id"]] = lines[source]
+        steps[meal["meal_id"]] = steps.get(source, [])
+    return unsourced

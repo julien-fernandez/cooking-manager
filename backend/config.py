@@ -1,0 +1,25 @@
+"""App configuration from environment variables."""
+
+import os
+
+DATABASE_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://cooking:cooking@127.0.0.1:5432/cooking_manager",
+)
+
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8795"))
+
+DRIVE_A_REST_URL = os.environ.get("DRIVE_A_REST_URL", "http://127.0.0.1:3853")
+DRIVE_A_TIMEOUT = float(os.environ.get("DRIVE_A_TIMEOUT", "60"))
+
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL = os.environ.get("DEEPGRAM_MODEL", "nova-2")
+DEEPGRAM_LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "fr")
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "https://ollama.com")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:cloud")
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")

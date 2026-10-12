@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate">
+<title>Cuisine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@200;400&family=Lato:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css?v=7">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__inner">
+    <a class="brand" href="#/menu">Cuisine</a>
+    <nav class="nav" id="nav">
+      <button class="nav__link" data-route="menu">Semaine</button>
+      <button class="nav__link" data-route="recettes">Recettes</button>
+      <button class="nav__link" data-route="courses">Courses</button>
+      <button class="nav__link" data-route="validation">Valider</button>
+      <button class="nav__link" data-route="garde-manger">Stock</button>
+      <button class="nav__link" data-route="achats">Achats</button>
+      <button class="nav__link" data-route="import">Importer</button>
+    </nav>
+    <button class="icon-btn" id="theme-toggle" title="Thème clair / sombre" aria-label="Basculer le thème">◐</button>
+  </div>
+</header>
+
+<main id="app" class="page">
+  <div class="empty"><p class="empty__title">Chargement…</p></div>
+</main>
+
+<script src="app.js?v=7"></script>
+</body>
+</html>

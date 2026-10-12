@@ -1,0 +1,320 @@
+"""Unitaires — parser d'ingrédients et d'étapes."""
+
+import pytest
+
+from cooking_manager.ingredients import (
+    INVARIABLE_IN_S,
+    normalize_name,
+    parse_ingredient,
+    parse_recipe_body,
+)
+
+class TestQuantities:
+    def test_simple(self):
+        ing = parse_ingredient("350 g skyr nature 0%", 1)
+        assert (ing.qty_min, ing.unit, ing.parsed) == (350.0, "g", True)
+        assert ing.name == "skyr nature 0%"
+
+    def test_approximate_prefix(self):
+        assert parse_ingredient("~300 g abricots congelés", 1).qty_min == 300.0
+
+    def test_range_keeps_both_bounds(self):
+        """« 2–3 c.s. » : on garde le min ET le max, la liste de courses"""
+        ing = parse_ingredient("2–3 c.s. lait entier", 1)
+        assert (ing.qty_min, ing.qty_max, ing.unit) == (2.0, 3.0, "c.s.")
+
+    def test_decimal_comma(self):
+        assert parse_ingredient("1,5 kg pommes de terre", 1).qty_min == 1.5
+
+    def test_written_fraction(self):
+        assert parse_ingredient("1/2 c. à café de levure chimique", 1).qty_min == 0.5
+
+    @pytest.mark.parametrize("glyph,expected", [("½", 0.5), ("¼", 0.25), ("¾", 0.75)])
+    def test_typographic_fractions(self, glyph, expected):
+        """Le vault écrit « ½ oignon rouge » avec le vrai caractère — invisible"""
+        assert parse_ingredient(f"{glyph} oignon rouge, émincé", 1).qty_min == expected
+
+    def test_mixed_quantity(self):
+        assert parse_ingredient("1 ½ c.s. miel", 1).qty_min == 1.5
+
+class TestUnits:
+    @pytest.mark.parametrize("text,unit", [
+        ("100 g eau", "g"),
+        ("20 cl crème", "cl"),
+        ("2 c. à soupe de beurre de cacahuète", "c.s."),
+        ("1 c.c. extrait de vanille", "c.c."),
+        ("1 pincée de sel", "pincée"),
+        ("1 boîte de pois chiches", "boîte"),
+        ("1 scoop whey", "scoop"),
+    ])
+    def test_unit_variants(self, text, unit):
+        assert parse_ingredient(text, 1).unit == unit
+
+    def test_dotted_unit_is_recognized(self):
+        """Régression : `\b` après « c.c. » ne peut JAMAIS matcher — le point et"""
+        ing = parse_ingredient("1 c.c. extrait de vanille (5 ml)", 1)
+        assert ing.unit == "c.c."
+        assert ing.name.startswith("extrait de vanille")
+        assert not ing.name.startswith("c.c.")
+
+    def test_bare_count_defaults_to_piece(self):
+        ing = parse_ingredient("2 bananes bien mûres écrasées", 1)
+        assert (ing.qty_min, ing.unit) == (2.0, "pièce")
+
+class TestTolerance:
+    def test_quantityless_line_is_kept_raw(self):
+        """« Édulcorant au choix — qs » n'a pas de quantité : elle doit rester"""
+        ing = parse_ingredient("Édulcorant au choix (stévia, érythritol) — qs", 1)
+        assert ing.parsed is False
+        assert ing.raw.startswith("Édulcorant")
+        assert ing.name
+
+    def test_raw_is_always_preserved(self):
+        for text in ["350 g farine", "Sel, poivre", "Huile d'olive pour la poêle", "???"]:
+            assert parse_ingredient(text, 1).raw
+
+    def test_optional_is_detected(self):
+        for text in ["1 g gomme xanthane (texture, optionnel)",
+                     "Édulcorant au choix",
+                     "50 g noix — facultatif"]:
+            assert parse_ingredient(text, 1).is_optional
+
+    def test_markdown_bold_is_stripped(self):
+        ing = parse_ingredient("**150 g** de chocolat noir 70%+", 1)
+        assert ing.qty_min == 150.0
+
+class TestNormalizeName:
+    def test_matches_pantry_variants(self):
+        """La clé d'appariement doit faire se rencontrer « miel » et"""
+        assert normalize_name("Miel bio (liquide)") == normalize_name("miel")
+
+    def test_strips_accents_and_parentheses(self):
+        assert normalize_name("Crème fraîche (30% MG)") == "creme fraiche"
+
+    def test_strips_trailing_note(self):
+        assert normalize_name("whey isolate — optionnel") == "whey isolate"
+
+    @pytest.mark.parametrize("first,second", [
+        ("comté, en dés", "comté, râpé grossièrement"),
+        ("oignon jaune, ciselé", "oignons jaunes, ciselés"),
+        ("patates douces", "patates douces, en gros cubes"),
+        ("citron jaune", "citron jaune, en rondelles"),
+        ("ail", "ail, écrasées"),
+        ("tomates cerises, coupées en deux", "tomate cerise"),
+        ("champignons de Paris, émincés", "champignon de paris"),
+        ("pavés de saumon (environ 130 g pièce)", "pavé de saumon"),
+    ])
+    def test_la_decoupe_et_le_pluriel_ne_font_pas_deux_aliments(self, first, second):
+        """Deux lignes du même aliment = deux achats. Mesuré le 2026-09-07 :"""
+        assert normalize_name(first) == normalize_name(second)
+
+    @pytest.mark.parametrize("name,expected", [
+        ("lentilles vertes sèches", "lentille verte seche"),
+        ("mélange de légumes verts surgelés", "melange de legume vert surgele"),
+        ("crème fraîche épaisse", "creme fraiche epaisse"),
+        ("lait entier", "lait entier"),
+    ])
+    def test_un_etat_n_est_pas_une_decoupe(self, name, expected):
+        """« sèches », « surgelés », « fraîche », « entier » changent l'identité"""
+        assert normalize_name(name) == expected
+
+    @pytest.mark.parametrize("name,expected", [
+        ("œufs frais", "oeuf frais"),
+        ("fromage frais", "fromage frais"),
+        ("crème épaisse", "creme epaisse"),
+        ("chips de légumes", "chips de legume"),
+    ])
+    def test_un_adjectif_invariable_garde_son_s(self, name, expected):
+        """« frais » n'est pas le pluriel de « frai ». Repéré sur le stock réel"""
+        assert normalize_name(name) == expected
+
+    @pytest.mark.parametrize("name,expected", [
+        ("gésiers de canard confits", "gesier de canard confit"),
+        ("lardons fumés", "lardon fume"),
+        ("pilons de poulet", "pilon de poulet"),
+        ("poireaux", "poireau"),
+        ("choux de bruxelles", "chou de bruxelles"),
+    ])
+    def test_un_vrai_pluriel_se_singularise(self, name, expected):
+        assert normalize_name(name) == expected
+
+    @pytest.mark.parametrize("word", [
+        "pois chiches", "ananas", "jus de citron", "maïs doux", "cassis",
+        "noix de coco", "anis étoilé", "dos de cabillaud",
+    ])
+    def test_les_invariables_en_s_et_le_x_final_survivent(self, word):
+        """Le pluriel se retire, pas la dernière lettre d'un mot qui finit en s"""
+        normalized = normalize_name(word)
+        for source, result in zip(word.lower().split(), normalized.split(), strict=False):
+            if source.endswith(("s", "x")) and source in INVARIABLE_IN_S | {"doux", "noix"}:
+                assert result == source, f"{source} → {result}"
+
+class TestRecipeBody:
+    BODY = """
+# Titre
+
+## Ingrédients (1 pot Creami)
+
+- 350 g skyr nature 0%
+- 30 g whey isolate vanille (1 scoop)
+- 1 c.c. extrait de vanille
+- Édulcorant au choix — qs
+
+**Variantes testées** : remplacer le skyr par du fromage blanc.
+
+## Préparation (10 min + 24h congélation)
+
+1. Fouetter tous les ingrédients.
+2. Congeler 24h à plat.
+3. Cycle Lite Ice Cream.
+
+## Notes techniques
+
+- Le pudding mix améliore la texture.
+"""
+
+    def test_extracts_ingredients_and_steps(self):
+        content = parse_recipe_body(self.BODY)
+        assert len(content.ingredients) == 4
+        assert len(content.steps) == 3
+        assert content.steps[0].text.startswith("Fouetter")
+
+    def test_bold_note_closes_the_ingredient_list(self):
+        """« **Variantes testées** : … » est une note, pas un ingrédient —"""
+        names = [i.name for i in parse_recipe_body(self.BODY).ingredients]
+        assert not any("Variantes" in n for n in names)
+
+    def test_later_sections_are_not_swallowed(self):
+        """La section « Notes techniques » ne doit pas polluer les étapes."""
+        content = parse_recipe_body(self.BODY)
+        assert not any("pudding" in s.text for s in content.steps)
+
+    GROUPED_BODY = """
+# Mafé au poisson et légumes
+
+## Ingrédients (10 portions)
+
+### Poisson et légumes
+
+- 1,2 kg filets de merlu
+- 4 carottes
+
+### Sauce mafé
+
+- 200 g pâte d'arachide
+- 1 boîte concentré de tomate
+
+## Préparation (50 min)
+
+### Sauce
+
+1. Délayer la pâte d'arachide.
+2. Ajouter le concentré.
+
+### Cuisson
+
+3. Pocher le poisson 10 min.
+
+## Notes
+
+- Se congèle très bien.
+"""
+
+    def test_subsections_do_not_close_the_ingredient_list(self):
+        """« ## Ingrédients » puis « ### Base » : la borne de fin se compare au"""
+        content = parse_recipe_body(self.GROUPED_BODY)
+        names = [i.name for i in content.ingredients]
+        assert len(content.ingredients) == 4, names
+        assert "filets de merlu" in names[0]
+        assert names[2].startswith("pâte d'arachide")
+
+    def test_subsection_titles_are_not_ingredients(self):
+        """Les sous-titres n'ont pas de puce : ils ne doivent pas entrer dans la"""
+        names = [i.name for i in parse_recipe_body(self.GROUPED_BODY).ingredients]
+        assert not any("Sauce mafé" in n or "Poisson et légumes" in n for n in names)
+
+    def test_grouped_steps_span_subsections(self):
+        """Même borne pour les étapes : la cuisson ne doit pas être perdue."""
+        steps = parse_recipe_body(self.GROUPED_BODY).steps
+        assert len(steps) == 3
+        assert steps[2].text.startswith("Pocher")
+
+    def test_grouped_body_stops_before_notes(self):
+        """La borne reste ferme sur un titre de MÊME rang : « ## Notes » clôt."""
+        content = parse_recipe_body(self.GROUPED_BODY)
+        assert not any("congèle" in s.text for s in content.steps)
+        assert not any("congèle" in i.raw for i in content.ingredients)
+
+    def test_numbered_section_titles_are_recognized(self):
+        """Une fiche rédigée en plan numéroté (« ## 3. Ingrédients ») porte les"""
+        body = (
+            "# Gratin\n\n## 3. Ingrédients (4 pers)\n\n"
+            "- Courge spaghetti — ~2 kg brute\n- Feta AOP — 180 g\n\n"
+            "## 4. Exécution\n\n1. Percer la courge.\n2. Enfourner 30 min.\n"
+        )
+        content = parse_recipe_body(body)
+        assert len(content.ingredients) == 2
+        assert len(content.steps) == 2
+
+    def test_parse_rate(self):
+        content = parse_recipe_body(self.BODY)
+        assert content.parse_rate == 0.75
+
+    def test_empty_body_is_safe(self):
+        content = parse_recipe_body("")
+        assert content.ingredients == [] and content.steps == []
+        assert content.parse_rate == 1.0
+
+    def test_positions_are_sequential(self):
+        content = parse_recipe_body(self.BODY)
+        assert [i.position for i in content.ingredients] == [1, 2, 3, 4]
+        assert [s.position for s in content.steps] == [1, 2, 3]
+
+    def test_steps_are_stripped_of_markdown(self):
+        """Le corps est du markdown, l'app rend du texte : les étapes"""
+        body = "## Préparation\n\n1. Congeler **24h minimum** à plat.\n2. Cycle *Lite Ice Cream*.\n"
+        steps = parse_recipe_body(body).steps
+        assert steps[0].text == "Congeler 24h minimum à plat."
+        assert steps[1].text == "Cycle Lite Ice Cream."
+
+
+class TestInverseFormat:
+    """#62 — `Courge spaghetti — ~2 kg brute` doit être parsé."""
+
+    def test_name_dash_qty_unit(self):
+        ing = parse_ingredient("Courge spaghetti \u2014 ~2 kg brute", 1)
+        assert ing.parsed
+        assert ing.name == "Courge spaghetti"
+        assert ing.qty_min == 2.0
+        assert ing.unit == "kg"
+
+    def test_name_dash_count(self):
+        ing = parse_ingredient("\u0152ufs \u2014 6", 2)
+        assert ing.parsed
+        assert ing.qty_min == 6.0
+        assert ing.unit == "pi\u00e8ce"
+        assert "oeuf" in ing.name_normalized
+
+    def test_name_dash_qty_with_detail(self):
+        ing = parse_ingredient("Pois chiches en bocal \u2013 480 g \u00e9goutt\u00e9s", 3)
+        assert ing.parsed
+        assert ing.qty_min == 480.0
+        assert ing.unit == "g"
+
+    def test_glose_dash_not_mistaken_for_inverse(self):
+        """Un tiret cadratin suivi de texte sans quantit\u00e9 n'est PAS inverse."""
+        ing = parse_ingredient("\u00c9dulcorant au choix \u2014 qs", 4)
+        assert not ing.parsed or ing.name == "\u00c9dulcorant au choix"
+
+    def test_optional_glose_not_mistaken(self):
+        ing = parse_ingredient("Cr\u00e8me \u2014 optionnel", 5)
+        assert ing.is_optional
+
+
+class TestUneCuillereSansPrecision:
+    def test_une_cuillere_de_moutarde_est_une_cuillere_a_soupe(self):
+        ing = parse_ingredient("1 cuillère de moutarde", 1)
+        assert (ing.qty_min, ing.unit, ing.name_normalized) == (1.0, "c.s.", "moutarde")
+
+    def test_la_cuillere_a_cafe_reste_une_cuillere_a_cafe(self):
+        assert parse_ingredient("1 cuillère à café de cumin", 1).unit == "c.c."
